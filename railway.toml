@@ -1,0 +1,7 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python terminal_okx_paper.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
