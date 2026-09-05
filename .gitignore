@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Outputs gerados (HTML grandes, debug)
+output*.html
+realtime*.html
+test_*.html
+debug_output.txt
+
+# Dados gerados localmente
+data/*.csv
+data/*.json
+
+# OS
+Thumbs.db
+.DS_Store
