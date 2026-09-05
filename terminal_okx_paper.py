@@ -18,6 +18,7 @@ import hashlib
 import base64
 import json
 import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pandas as pd
 
 
@@ -923,10 +924,192 @@ class OKXPaperTerminal:
         
         print(f"OKX Paper Trading conectado - {len(self.dashboard.traders)} traders")
         print("Dashboard rodando... Ctrl+C para sair\n")
-        
+
+        # Web dashboard acessivel pelo navegador (porta $PORT na Railway)
+        try:
+            self.web = WebDashboard(self)
+            self.web.start()
+        except Exception as e:
+            print(f"Web dashboard nao iniciado: {e}")
+
         await self.dashboard.run_async(self.okx_trader, self.check_signals)
         
         await self.okx_trader.close()
+
+
+# ===== Web Dashboard (HTTP - acessivel pelo navegador) =====
+class WebDashboard:
+    """Serve uma pagina HTML + /api/state com o estado ao vivo do bot paper."""
+
+    HTML = """<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OKX Paper Trading - Dashboard</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0b0f17;color:#d7e0ea;font:14px/1.45 Consolas,Menlo,monospace;padding:16px}
+h1{font-size:18px;color:#5eead4;letter-spacing:1px}
+.sub{color:#64748b;font-size:12px;margin:4px 0 14px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px}
+.card{background:#111827;border:1px solid #1f2a3d;border-radius:8px;padding:10px 12px}
+.card .k{color:#64748b;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+.card .v{font-size:20px;font-weight:bold;margin-top:2px}
+.pos{color:#34d399}.neg{color:#f87171}.neu{color:#fbbf24}
+table{width:100%;border-collapse:collapse;margin-bottom:14px;background:#0f1626;border-radius:8px;overflow:hidden}
+th{background:#16223a;color:#5eead4;text-align:left;padding:7px 10px;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+td{padding:6px 10px;border-top:1px solid #182338;font-size:13px;white-space:nowrap}
+tr:hover td{background:#141e31}
+.pill{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;font-weight:bold}
+.pill.on{background:#065f46;color:#6ee7b7}.pill.off{background:#7f1d1d;color:#fca5a5}
+.pill.win{background:#065f46;color:#6ee7b7}.pill.loss{background:#7f1d1d;color:#fca5a5}.pill.w8{background:#374151;color:#cbd5e1}
+.logs{background:#0a0f1a;border:1px solid #1f2a3d;border-radius:8px;padding:10px;font-size:12px;color:#94a3b8;max-height:220px;overflow-y:auto}
+.logs b{color:#5eead4}
+.mkt{display:inline-block;margin:0 14px 8px 0;background:#111827;border:1px solid #1f2a3d;padding:6px 10px;border-radius:6px;font-size:12px}
+.mkt .sym{color:#5eead4;font-weight:bold}
+#live{color:#34d399;font-size:11px}
+#live.off{color:#f87171}
+</style></head><body>
+<h1>OKX PAPER TRADING <span id="live">● AO VIVO</span></h1>
+<div class="sub" id="clock">conectando...</div>
+<div class="cards" id="cards"></div>
+<div class="mkt" id="market"></div>
+<h1 style="font-size:14px;margin-bottom:8px">TRADERS</h1>
+<table id="traders"><thead></thead><tbody></tbody></table>
+<h1 style="font-size:14px;margin-bottom:8px">OPERACOES (ULTIMAS 50)</h1>
+<table id="ops"><thead></thead><tbody></tbody></table>
+<h1 style="font-size:14px;margin-bottom:8px">POSICOES OKX</h1>
+<table id="pos"><thead></thead><tbody></tbody></table>
+<h1 style="font-size:14px;margin-bottom:8px">LOGS &amp; SINAIS</h1>
+<div class="logs" id="logs"></div>
+<script>
+const fmt=v=>v==null?'--':Number(v).toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2});
+const cls=v=>v>0?'pos':(v<0?'neg':'neu');
+const pnl=v=>`<span class="${cls(v)}">${v>0?'+':''}${fmt(v)}</span>`;
+async function refresh(){
+  try{
+    const r=await fetch('/api/state',{cache:'no-store'});
+    if(!r.ok) throw 0;
+    const s=await r.json();
+    document.getElementById('live').className='';
+    document.getElementById('clock').textContent='Atualizado: '+s.local_ts+'  |  '+s.ts;
+    const st=s.stats,ac=s.account||{};
+    const cards=[
+      ['P&L TOTAL',pnl(st.total_pnl),st.total_pnl],
+      ['WIN RATE',`<span class="${st.win_rate>=60?'pos':(st.win_rate>=50?'neu':'neg')}">${st.win_rate}%</span>`,0],
+      ['OPS',st.operations,0],['WINS',`<span class="pos">${st.wins}</span>`,0],
+      ['LOSSES',`<span class="neg">${st.losses}</span>`,0],
+      ['SALDO OKX','$'+fmt(ac.balance),0],
+      ['DISPONIVEL','$'+fmt(ac.available),0],
+      ['P&L OKX',pnl(ac.total_pnl),ac.total_pnl||0],
+      ['POSICOES',ac.positions??'--',0]
+    ];
+    document.getElementById('cards').innerHTML=cards.map(c=>`<div class="card"><div class="k">${c[0]}</div><div class="v">${c[1]}</div></div>`).join('');
+    const mk=symbol=>(s.market||{})[symbol]||{};
+    document.getElementById('market').innerHTML=Object.keys(s.market||{}).map(sym=>{
+      const m=mk(sym);const l=parseFloat(m.last),o=parseFloat(m.open24h);
+      const ch=o?((l-o)/o*100):null;
+      return `<span class="mkt"><span class="sym">${sym}</span> ${fmt(m.last)} <span class="${cls(ch)}">${ch==null?'':(ch>0?'+':'')+fmt(ch)+'%'}</span></span>`;
+    }).join('');
+    document.getElementById('traders').innerHTML=`<thead><tr><th>#</th><th>TRADER</th><th>PAR</th><th>BET</th><th>EXP</th><th>ST</th><th>WINS</th><th>LOSSES</th><th>WR%</th><th>P&L</th><th>STREAK</th></tr></thead><tbody>`+s.traders.map((t,i)=>`<tr><td>${i+1}</td><td>${t.name}</td><td>${t.pair}</td><td>$${fmt(t.bet_size)}</td><td>${t.expiration}s</td><td><span class="pill ${t.enabled?'on':'off'}">${t.enabled?'ON':'OFF'}</span></td><td class="pos">${t.wins}</td><td class="neg">${t.losses}</td><td class="${t.win_rate>=60?'pos':(t.win_rate>=50?'neu':'neg')}">${t.win_rate}%</td><td>${pnl(t.total_pnl)}</td><td class="${cls(t.current_streak)}">${t.current_streak?((t.current_streak>0?'+':'')+t.current_streak+' '+t.streak_type):'--'}</td></tr>`).join('')+`</tbody>`;
+    document.getElementById('ops').innerHTML=`<thead><tr><th>HORA</th><th>TRADER</th><th>PAR</th><th>DIR</th><th>BET</th><th>PROB</th><th>RESULTADO</th><th>ST</th><th>P&L ACC</th></tr></thead><tbody>`+(s.operations.length?s.operations.slice().reverse().map(o=>`<tr><td>${o.timestamp}</td><td>${o.trader}</td><td>${o.pair}</td><td class="${o.direction==='CALL'?'pos':'neg'}">${o.direction==='CALL'?'▲ CALL':'▼ PUT'}</td><td>$${fmt(o.bet)}</td><td>${fmt(o.probability)}</td><td>${o.result==null?'--':pnl(o.result)}</td><td><span class="pill ${o.status==='WIN'?'win':(o.status==='LOSS'?'loss':'w8')}">${o.status==='Aguardando'?'AGUARDANDO':o.status}</span></td><td>${pnl(o.cumulative_pnl)}</td></tr>`).join(''):`<tr><td colspan="9" style="color:#64748b">Aguardando operacoes...</td></tr>`)+`</tbody>`;
+    const pos=(s.positions||[]);
+    document.getElementById('pos').innerHTML=`<thead><tr><th>SIMBOLO</th><th>LADO</th><th>TAM</th><th>ENTRADA</th><th>MARK</th><th>P&L NAO REALIZADO</th></tr></thead><tbody>`+(pos.length?pos.map(p=>`<tr><td>${p.symbol}</td><td class="${p.side==='long'?'pos':'neg'}">${p.side.toUpperCase()}</td><td>${p.size}</td><td>$${fmt(p.entry_price)}</td><td>$${fmt(p.mark_price)}</td><td>${pnl(p.unrealized_pnl)}</td></tr>`).join(''):`<tr><td colspan="6" style="color:#64748b">Nenhuma posicao aberta</td></tr>`)+`</tbody>`;
+    document.getElementById('logs').innerHTML=(s.logs||[]).map(l=>`<div>${l.replace(/Analisando|SINAL|RESOLVIDO|Erro/g,'<b>$&</b>')}</div>`).join('')||'<div>sem logs</div>';
+  }catch(e){
+    document.getElementById('live').className='off';
+    document.getElementById('live').textContent='● SEM SINAL';
+  }
+}
+setInterval(refresh,3000);refresh();
+</script></body></html>"""
+
+    def __init__(self, terminal):
+        self.terminal = terminal
+        self.port = int(os.environ.get("PORT", "8080"))
+        self._httpd = None
+
+    def _state(self) -> dict:
+        term = self.terminal
+        dash = term.dashboard
+        state = {
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "local_ts": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            "stats": dash.get_total_stats(),
+            "traders": [tr.get_stats() for tr in dash.traders.values()],
+            "logs": list(dash.log_messages),
+        }
+        if term.okx_trader:
+            try:
+                state["account"] = term.okx_trader.get_summary()
+            except Exception:
+                state["account"] = {}
+            state["positions"] = [
+                {"symbol": p.get("symbol"), "side": p.get("side"),
+                 "size": p.get("size"), "entry_price": round(p.get("entry_price", 0), 4),
+                 "mark_price": round(p.get("mark_price", 0), 4),
+                 "unrealized_pnl": round(p.get("unrealized_pnl", 0), 2)}
+                for p in term.okx_trader.positions.values()
+            ]
+            state["market"] = {
+                sym: {"last": t.get("last"), "bidPx": t.get("bidPx"),
+                      "askPx": t.get("askPx"), "open24h": t.get("open24h")}
+                for sym, t in term.okx_trader.market_data.items()
+            }
+        ops = []
+        for name, tr in dash.traders.items():
+            for td in tr.trades:
+                ops.append({
+                    "trader": name, "id": td.id, "timestamp": td.timestamp,
+                    "pair": td.pair, "direction": td.direction, "bet": td.bet,
+                    "probability": td.probability, "result": td.result,
+                    "status": td.status, "cumulative_pnl": td.cumulative_pnl,
+                })
+        ops.sort(key=lambda o: (o["trader"], o["id"]))
+        state["operations"] = ops[-50:]
+        return state
+
+    def start(self):
+        if self._httpd:
+            return
+        try:
+            self._httpd = ThreadingHTTPServer(("0.0.0.0", self.port), _WebHandler)
+            self._httpd.dashboard = self
+            thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+            thread.start()
+            print(f"Web dashboard no ar: http://0.0.0.0:{self.port}")
+        except Exception as e:
+            print(f"Web dashboard indisponivel na porta {self.port}: {e}")
+            self._httpd = None
+
+
+class _WebHandler(BaseHTTPRequestHandler):
+    server_version = "OKXPaperWeb/1.0"
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path == "/api/state":
+            body = json.dumps(self.server.dashboard._state()).encode()
+            ctype = "application/json"
+        elif path in ("/", "/index.html"):
+            body = self.server.dashboard.HTML.encode()
+            ctype = "text/html; charset=utf-8"
+        else:
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
+
+    def log_message(self, *args):
+        pass
 
 
 def main():
