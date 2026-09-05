@@ -12,11 +12,21 @@ import warnings
 import time
 import string
 import random
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from stacked_imbalance import enrich_orderflow_for_plotting, get_stacked_summary
+    STACKED_IMBALANCE_AVAILABLE = True
+except ImportError:
+    STACKED_IMBALANCE_AVAILABLE = False
 
 warnings.filterwarnings('ignore')
 
 class OrderFlowChart():
-    def __init__(self, orderflow_data, ohlc_data, identifier_col=None, imbalance_col=None, **kwargs):
+    def __init__(self, orderflow_data, ohlc_data, identifier_col=None, imbalance_col=None, 
+                 stacked_threshold=3.0, stacked_min_levels=3, show_stacked=True, **kwargs):
         """
         The constructor for OrderFlowChart class.
         It takes in the orderflow data and the ohlc data and creates a unique identifier for each candle if not provided.
@@ -26,6 +36,11 @@ class OrderFlowChart():
         ohlc_data: ['open', 'high', 'low', 'close', 'identifier']
 
         The identifier column is used to map the orderflow data to the ohlc data.
+        
+        Stacked Imbalance Parameters:
+        - stacked_threshold: ratio threshold for diagonal imbalance (default 3.0 = 300%)
+        - stacked_min_levels: minimum consecutive levels for stacked (default 3)
+        - show_stacked: whether to highlight stacked imbalances in heatmap (default True)
         """
 
         if 'data' in kwargs:
@@ -38,6 +53,9 @@ class OrderFlowChart():
             self.ohlc_data = ohlc_data
             self.identifier_col = identifier_col
             self.imbalance_col = imbalance_col
+            self.stacked_threshold = stacked_threshold
+            self.stacked_min_levels = stacked_min_levels
+            self.show_stacked = show_stacked
             self.is_processed = False
             self.granularity = abs(self.orderflow_data.iloc[0]['price'] - self.orderflow_data.iloc[1]['price'])
 
@@ -72,7 +90,7 @@ class OrderFlowChart():
 
         df['text'] = pd.Series(bids, index=df.index) + '  ' + \
             pd.Series(asks, index=df.index)
-        df.index = df['identifier']
+        df = df.set_index('identifier')
         
         if self.imbalance_col is None:
             print("Calculating imbalance, as no imbalance column was provided.")
@@ -91,7 +109,7 @@ class OrderFlowChart():
         df2['sum'] = df2['sum'] / df2.groupby(df2.index)['sum'].transform('max')
         df2['text'] = ''
         df2['time'] = df2['time'].astype(str)
-        df2['text'] = ['█' * int(sum_ * 10) for sum_ in df2['sum']]
+        df2['text'] = ['#' * int(sum_ * 10) for sum_ in df2['sum']]
         df2['text'] = '                    ' + df2['text']
         df2['time'] = df2['time'].astype(str)
         return df2
@@ -149,7 +167,7 @@ class OrderFlowChart():
         return labels
 
     def plot_ranges(self, ohlc):
-        ymin = ohlc['high'][-1] + 1
+        ymin = ohlc['high'].iloc[-1] + 1
         ymax = ymin - int(48*self.granularity)
         xmax = ohlc.shape[0]
         xmin = xmax - 9
@@ -165,6 +183,32 @@ class OrderFlowChart():
         self.create_sequence()
     
         self.df = self.calc_imbalance(self.orderflow_data)
+        
+        # Calculate stacked imbalances
+        if self.show_stacked and STACKED_IMBALANCE_AVAILABLE:
+            try:
+                # Reset index to work with identifier as column
+                df_for_stacked = self.df.reset_index()
+                df_enriched = enrich_orderflow_for_plotting(
+                    df_for_stacked, 
+                    threshold_ratio=self.stacked_threshold,
+                    min_stack=self.stacked_min_levels
+                )
+                # Restore index
+                self.df = df_enriched.set_index('identifier')
+                self.stacked_summary = get_stacked_summary(df_enriched, self.identifier_col)
+                print(f"Stacked imbalances found: {len(self.stacked_summary)}")
+            except Exception as e:
+                print(f"Stacked imbalance calculation failed: {e}")
+                self.df['stacked_buy'] = 0
+                self.df['stacked_sell'] = 0
+                self.df['stack_text'] = ''
+                self.stacked_summary = pd.DataFrame()
+        else:
+            self.df['stacked_buy'] = 0
+            self.df['stacked_sell'] = 0
+            self.df['stack_text'] = ''
+            self.stacked_summary = pd.DataFrame()
 
         self.df2 = self.annotate(self.df.copy())
 
@@ -315,8 +359,8 @@ class OrderFlowChart():
         # Create figure
         fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                             vertical_spacing=0.0, row_heights=[9, 1])
-
-        fig.add_trace(go.Scatter(x=self.df2['identifier'], y=self.df2['price'], text=self.df2['text'],
+        
+        fig.add_trace(go.Scatter(x=self.df2.index, y=self.df2['price'], text=self.df2['text'],
                                 name='VolumeProfile', textposition='middle right',
                                 textfont=dict(size=8, color='rgb(0, 0, 255, 0.0)'), hoverinfo='none',
                                 mode='text', showlegend=True,
@@ -324,26 +368,73 @@ class OrderFlowChart():
                                 sizemode='area',
                                 sizeref=0.1,  # Adjust the size scaling factor as needed
                                 )), row=1, col=1)
-
+        
         # Add trace for orderflow data
-        fig.add_trace(
-            go.Heatmap(
-                x=self.df['identifier'],
-                y=self.df['price'],
-                z=self.df['size'],
-                text=self.df['text'],
-                colorscale='icefire_r',
-                showscale=False,
-                showlegend=True,
-                name='BidAsk',
-                texttemplate="%{text}",
-                textfont={
-                    "size": 11,
-                    "family": "Courier New"},
-                hovertemplate="Price: %{y}<br>Size: %{text}<br>Imbalance: %{z}<extra></extra>",
-                xgap=60),
-            row=1,
-            col=1)
+        # Create custom z values for stacked imbalance highlighting
+        z_values = self.df['size'].copy()
+        hover_text = self.df['text'].copy()
+        
+        # Add stacked imbalance info to hover
+        if 'stack_text' in self.df.columns:
+            stacked_text = self.df['stack_text'].fillna('')
+            hover_text = hover_text + '<br>' + stacked_text.replace('', 'Stacked: ')
+            hover_text = hover_text.replace('Stacked: <br>', '')
+        
+        # Custom colorscale: icefire_r for normal, bright green/red for stacked
+        # We'll use a custom approach: modify z for stacked cells
+        if 'stacked_buy' in self.df.columns and 'stacked_sell' in self.df.columns:
+            # Create custom z: 2 for stacked buy, -2 for stacked sell, original for others
+            z_custom = z_values.copy()
+            z_custom[self.df['stacked_buy'] == 1] = 2.0
+            z_custom[self.df['stacked_sell'] == 1] = -2.0
+            
+            # Custom colorscale with distinct stacked colors
+            colorscale = [
+                [0.0, '#000000'],      # -2: stacked sell (dark red)
+                [0.25, '#ff0000'],     # -1 to 0: sell imbalance
+                [0.5, '#ffffff'],      # 0: neutral
+                [0.75, '#00ff00'],     # 0 to 1: buy imbalance
+                [1.0, '#00aa00'],      # 2: stacked buy (bright green)
+            ]
+            
+            fig.add_trace(
+                go.Heatmap(
+                    x=self.df.index,
+                    y=self.df['price'],
+                    z=z_custom,
+                    text=self.df['text'],
+                    customdata=stacked_text if 'stack_text' in self.df.columns else None,
+                    colorscale=colorscale,
+                    showscale=False,
+                    showlegend=True,
+                    name='BidAsk',
+                    texttemplate="%{text}",
+                    textfont={
+                        "size": 10,
+                        "family": "Courier New"},
+                    hovertemplate="Price: %{y}<br>Size: %{text}<br>Imbalance: %{z}<br>%{customdata}<extra></extra>",
+                    xgap=60),
+                row=1,
+                col=1)
+        else:
+            fig.add_trace(
+                go.Heatmap(
+                    x=self.df.index,
+                    y=self.df['price'],
+                    z=z_values,
+                    text=hover_text,
+                    colorscale='icefire_r',
+                    showscale=False,
+                    showlegend=True,
+                    name='BidAsk',
+                    texttemplate="%{text}",
+                    textfont={
+                        "size": 11,
+                        "family": "Courier New"},
+                    hovertemplate="Price: %{y}<br>Size: %{text}<br>Imbalance: %{z}<extra></extra>",
+                    xgap=60),
+                row=1,
+                col=1)
 
         fig.add_trace(
             go.Scatter(
