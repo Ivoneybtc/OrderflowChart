@@ -17,3 +17,6 @@ data/*.json
 # OS
 Thumbs.db
 .DS_Store
+
+# Scripts locais (contem credenciais das env vars)
+*.bat
