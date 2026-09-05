@@ -115,13 +115,14 @@ class OKXPaperTrader:
         )
         return base64.b64encode(mac.digest()).decode()
     
-    def _get_headers(self, method: str, request_path: str, body: str = "") -> Dict[str, str]:
-        timestamp = str(time.time())
-        sign = self._sign(timestamp, method, request_path, body)
+    def _get_headers(self, method: str, request_path: str, body: str = "", timestamp: str = None) -> Dict[str, str]:
+        # Timestamp ISO 8601 unico (mesmo usado na assinatura) - exigencia da OKX
+        ts = timestamp or (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
+        sign = self._sign(ts, method, request_path, body)
         headers = {
             "OK-ACCESS-KEY": self.creds["api_key"],
             "OK-ACCESS-SIGN": sign,
-            "OK-ACCESS-TIMESTAMP": str(time.time()),
+            "OK-ACCESS-TIMESTAMP": ts,
             "OK-ACCESS-PASSPHRASE": self.creds["passphrase"],
             "Content-Type": "application/json",
             "x-simulated-trading": "1"
@@ -191,76 +192,55 @@ class OKXPaperTrader:
         size: float,
         price: Optional[float] = None,
         leverage: int = 1,
-        signal_info: str = ""
+        signal_info: str = "",
+        tgt_ccy: Optional[str] = None,
+        size_is_quote: bool = False
     ) -> Dict:
-        order_id = f"paper_{int(time.time() * 1000)}"
-        order = {
-            "id": order_id,
-            "symbol": symbol,
+        """Ordem REAL de mercado na OKX demo (spot, tdMode=cash).
+        - size_is_quote=True (market buy): sz em USDT (moeda de cotacao) = valor em $.
+        - senao: sz em quantidade do ativo base (ex.: BTC)."""
+        body = {
+            "instId": symbol,
+            "tdMode": "cash",
             "side": side,
-            "size": size,
-            "price": price,
-            "status": "LIVE",
-            "filled_size": 0.0,
-            "avg_price": 0.0,
-            "fee": 0.0,
-            "signal_info": signal_info,
-            "created_at": datetime.now(timezone.utc)
+            "ordType": "market",
+            "sz": str(size),
         }
-        
-        await asyncio.sleep(0.05)
-        
-        fill = self._simulate_fill(side, size, price, symbol)
-        
-        order["status"] = "FILLED"
-        order["filled_size"] = size
-        order["avg_price"] = fill["fill_price"]
-        order["fee"] = fill["fee"]
-        
-        notional = fill["fill_price"] * size
-        fee = fill["fee"]
-        
-        if side == "buy":
-            cost = notional + fee
-            if self.account.available >= cost:
-                self.account.available -= cost
-                self.account.frozen += cost
-                pos_key = f"{symbol}_long"
-                if pos_key in self.positions:
-                    pos = self.positions[pos_key]
-                    total = pos["size"] + size
-                    pos["entry_price"] = (pos["entry_price"] * pos["size"] + fill["fill_price"] * size) / total
-                    pos["size"] = total
-                else:
-                    self.positions[f"{symbol}_long"] = {
-                        "symbol": symbol, "side": "long", "size": size,
-                        "entry_price": fill["fill_price"], "mark_price": fill["mid_price"],
-                        "unrealized_pnl": 0.0, "realized_pnl": 0.0
-                    }
-            else:
-                proceeds = notional - fee
-                self.account.available += proceeds
-                pos_key = f"{symbol}_short"
-                if pos_key in self.positions:
-                    pos = self.positions[pos_key]
-                    total = pos["size"] + size
-                    pos["entry_price"] = (pos["entry_price"] * pos["size"] + fill["fill_price"] * size) / total
-                    pos["size"] = total
-                else:
-                    self.positions[f"{symbol}_short"] = {
-                        "symbol": symbol, "side": "short", "size": size,
-                        "entry_price": fill["fill_price"], "mark_price": fill["mid_price"],
-                        "unrealized_pnl": 0.0, "realized_pnl": 0.0
-                    }
-        
-        order["status"] = "FILLED"
-        order["filled_size"] = size
-        order["avg_price"] = fill["fill_price"]
-        order["fee"] = fill["fee"]
-        order["updated_at"] = datetime.now(timezone.utc)
-        
-        self.orders[order_id] = order
-        return order
+        if tgt_ccy:
+            body["tgtCcy"] = tgt_ccy
+        resp = await self._request("POST", "/api/v5/trade/order", body=body)
+        if resp.get("code") != "0":
+            return {"ok": False, "error": resp.get("msg") or resp.get("code") or "erro desconhecido"}
+        ord_id = resp["data"][0]["ordId"]
+        # Aguarda o preenchimento e busca o fill real (preco + fee + quantidade da OKX)
+        for _ in range(12):
+            await asyncio.sleep(0.5)
+            fill = await self._get_fill(symbol, ord_id)
+            if fill:
+                return {
+                    "ok": True, "ord_id": ord_id, "side": side, "size": size,
+                    "avg_px": fill["avg_px"], "fee": fill["fee"],
+                    "fill_sz": fill.get("fill_sz") or 0.0,
+                    "fill_ccy": fill.get("fill_ccy") or ""
+                }
+        return {"ok": False, "error": "ordem enviada mas fill nao confirmado", "ord_id": ord_id}
+
+    async def _get_fill(self, symbol: str, ord_id: str) -> Optional[Dict]:
+        resp = await self._request("GET", f"/api/v5/trade/fills?instId={symbol}&ordId={ord_id}")
+        data = resp.get("data") or []
+        if not data:
+            return None
+        f = data[0]
+        try:
+            avg_px = float(f.get("fillPx") or f.get("avgPx") or 0)
+            fee = float(f.get("fee") or 0)
+            fill_sz = float(f.get("fillSz") or 0)
+        except (TypeError, ValueError):
+            return None
+        if avg_px <= 0:
+            return None
+        return {"avg_px": avg_px, "fee": fee, "fill_sz": fill_sz,
+                "fill_ccy": f.get("fillCcy") or ""}
     
     def update_mark_prices(self):
         for key, pos in self.positions.items():
@@ -724,6 +704,9 @@ class OKXPaperTerminal:
         self.dashboard = TerminalDashboard(real_mode=True)
         self.okx_trader = None
         self.running = False
+        # specs spot por simbolo (lotSz/minSz) e operacoes abertas
+        self.lot_sizes: Dict[str, Dict] = {}
+        self._open: Dict[str, Dict] = {}
     
     async def initialize(self):
         self.okx_trader = OKXPaperTrader(
@@ -738,6 +721,28 @@ class OKXPaperTerminal:
         if "code" in instruments and instruments["code"] != "0":
             raise Exception(f"OKX API Error: {instruments}")
         print(f"OKX Paper Trading conectado (Demo: True)")
+
+        # Specs spot (lotSz/minSz) dos 4 pares - para converter $ em quantidade
+        for sym in ("BTC-USDT", "ETH-USDT", "BNB-USDT", "SOL-USDT"):
+            r = await self.okx_trader._request("GET", f"/api/v5/public/instruments?instType=SPOT&instId={sym}")
+            d = (r.get("data") or [None])
+            if d and d[0]:
+                inst = d[0]
+                self.lot_sizes[sym] = {
+                    "lotSz": inst.get("lotSz"), "minSz": inst.get("minSz"),
+                    "tickSz": inst.get("tickSz")
+                }
+
+        # Saldo real da conta demo (USDT spot) para o dashboard
+        try:
+            bal = await self.okx_trader._request("GET", "/api/v5/account/balance?ccy=USDT")
+            det = ((bal.get("data") or [{}])[0].get("details") or [{}])[0]
+            usdt = float(det.get("availBal") or det.get("cashBal") or 0)
+            if usdt > 0:
+                self.okx_trader.account.balance = usdt
+                self.okx_trader.account.available = usdt
+        except Exception:
+            pass
     
     def add_trader(self, name: str, pair: str, bet_size: float = 10.0, expiration: int = 60):
         trader = Trader(name, pair, bet_size, expiration)
@@ -860,37 +865,126 @@ class OKXPaperTerminal:
                 strongest = current_stacks.loc[current_stacks["avg_ratio"].idxmax()]
                 direction = "CALL" if strongest["direction"] == "buy" else "PUT"
                 prob = min(0.95, 0.55 + (strongest["avg_ratio"] - 3.0) * 0.1)
-                
+
                 signal_info = f"Stacked {strongest['direction']} {int(strongest['levels'])}x @ {strongest['avg_ratio']:.1f}x | Price {strongest['price_min']:.2f}-{strongest['price_max']:.2f}"
-                
+
+                # ===== Execucao REAL na OKX demo (spot) =====
+                # 1) preco atual para converter bet ($) em quantidade do ativo
+                ticker = self.okx_trader.market_data.get(symbol)
+                if not ticker or not float(ticker.get("last") or 0):
+                    t = await self.okx_trader._request("GET", f"/api/v5/market/ticker?instId={symbol}")
+                    tdata = t.get("data") or [{}]
+                    if tdata:
+                        self.okx_trader.market_data[symbol] = tdata[0]
+                        ticker = tdata[0]
+                last_px = float((ticker or {}).get("last") or 0)
+                if last_px <= 0:
+                    self.dashboard.log(f"{symbol}: sem preco de mercado para dimensionar ordem")
+                    continue
+
+                side = "buy" if direction == "CALL" else "sell"
+                raw_qty = trader.bet_size / last_px
+                qty = self._round_spot_qty(symbol, raw_qty)
+                if qty <= 0:
+                    self.dashboard.log(f"{symbol}: valor {trader.bet_size} abaixo do minimo spot")
+                    continue
+
+                # PUT em spot exige ter o ativo na conta demo
+                if side == "sell":
+                    base_ccy = symbol.split("-")[0]
+                    try:
+                        b = await self.okx_trader._request("GET", f"/api/v5/account/balance?ccy={base_ccy}")
+                        det = ((b.get("data") or [{}])[0].get("details") or [{}])[0]
+                        have = float(det.get("availBal") or 0)
+                    except Exception:
+                        have = 0.0
+                    if have < qty:
+                        self.dashboard.log(f"{symbol}: sem {base_ccy} suficiente p/ PUT (tem {have:.6f}, precisa {qty:.6f})")
+                        continue
+
+                # CALL (buy): ordem market em USDT (quote) = valor exato da bet.
+                # PUT (sell): ordem market em BTC (base) = quantidade calculada.
+                if side == "buy":
+                    resp = await self.okx_trader.paper_place_order(symbol, side, trader.bet_size, signal_info=signal_info)
+                else:
+                    resp = await self.okx_trader.paper_place_order(symbol, side, qty, signal_info=signal_info)
+                if not resp.get("ok"):
+                    self.dashboard.log(f"{symbol} {direction}: ordem rejeitada: {str(resp.get('error'))[:70]}")
+                    continue
+
+                # 2) ordem preenchida de verdade -> registra trade (qty real do fill)
                 trade = trader.add_trade(direction, prob, signal_info=signal_info)
-                
-                # Execute paper trade on OKX
-                order = await self.okx_trader.paper_place_order(
-                    symbol=trader.okx_symbol,
-                    side="buy" if direction == "CALL" else "sell",
-                    size=trader.bet_size / 100,  # Convert USD to approximate contracts
-                    signal_info=signal_info
-                )
-                
-                self.dashboard.log(f"SINAL {trade.id}: {name} {trader.pair} {direction} @ {prob:.2f} | Stacked {strongest['direction']} {int(strongest['levels'])}x @ {strongest['avg_ratio']:.1f}x")
-                
-                # Auto-resolve after expiration (simulate based on probability)
-                asyncio.create_task(self._auto_resolve(trader, trade.id, prob))
+                filled_qty = float(resp.get("fill_sz") or qty or 0)
+                if filled_qty <= 0:
+                    filled_qty = qty
+                self._open[trader.name] = {
+                    "trade_id": trade.id, "side": side, "qty": filled_qty,
+                    "entry_px": resp["avg_px"], "fee_open": resp["fee"],
+                    "symbol": symbol, "opened_at": datetime.now(timezone.utc).strftime("%H:%M:%S")
+                }
+                self.dashboard.log(f"SINAL {trade.id}: {name} {trader.pair} {direction} @ {prob:.2f} | {signal_info} | exec {side} {filled_qty} @ {resp['avg_px']:.2f}")
+
+                # 3) fecha apos a expiracao e resolve com P&L REAL
+                asyncio.create_task(self._auto_resolve(trader, trade, side, filled_qty))
                 
             except Exception as e:
                 self.dashboard.log(f"Erro analise {name}: {str(e)[:60]}")
     
-    async def _auto_resolve(self, trader: Trader, trade_id: int, prob: float):
+    def _round_spot_qty(self, symbol: str, qty: float) -> float:
+        """Arredonda para baixo ao multiplo do lote minimo do par spot."""
+        import math
+        info = self.lot_sizes.get(symbol) or {}
+        try:
+            lot = float(info.get("lotSz") or 1e-8)
+        except (TypeError, ValueError):
+            lot = 1e-8
+        if lot <= 0:
+            lot = 1e-8
+        return round(math.floor(qty / lot) * lot, 12)
+    
+    async def _auto_resolve(self, trader: Trader, trade, side: str, qty: float):
         await asyncio.sleep(trader.expiration)
-        import random
-        if random.random() < prob:
-            result = round(random.uniform(5, 25), 2)
+        name = trader.name
+        op = self._open.pop(name, None)
+        if not op:
+            return
+        symbol = op.get("symbol") or trader.okx_symbol
+        close_side = "sell" if side == "buy" else "buy"
+        # Fechamento: CALL -> vende o BTC comprado (sz base). PUT -> recompra o BTC (tgtCcy=base_ccy).
+        if close_side == "sell":
+            resp = await self.okx_trader.paper_place_order(symbol, close_side, qty)
         else:
-            result = -trader.bet_size
-        resolved = trader.resolve_trade(trade_id, result)
+            resp = await self.okx_trader.paper_place_order(symbol, close_side, qty, tgt_ccy="base_ccy")
+        if not resp.get("ok"):
+            self.dashboard.log(f"{name}: falha ao fechar ({resp.get('error')}) - tentando de novo")
+            await asyncio.sleep(5)
+            if close_side == "sell":
+                resp = await self.okx_trader.paper_place_order(symbol, close_side, qty)
+            else:
+                resp = await self.okx_trader.paper_place_order(symbol, close_side, qty, tgt_ccy="base_ccy")
+        if not resp.get("ok"):
+            self.dashboard.log(f"{name}: posicao NAO fechada ({resp.get('error')}) - atencao")
+            self._open[name] = op
+            return
+        # P&L real: diferenca de preco x quantidade - fees (ambos os lados)
+        exit_px = resp["avg_px"]
+        fee_close = abs(resp.get("fee") or 0)
+        fee_open = abs(op.get("fee_open") or 0)
+        if side == "buy":      # comprou e vendeu (long)
+            gross = (exit_px - op["entry_px"]) * qty
+        else:                   # vendeu e recomprou (short)
+            gross = (op["entry_px"] - exit_px) * qty
+        result = round(gross - fee_open - fee_close, 2)
+        try:
+            self.okx_trader.account.balance = round(
+                (self.okx_trader.account.balance or 0) + result, 2)
+            self.okx_trader.account.available = max(
+                0.0, round((self.okx_trader.account.available or 0) + result, 2))
+        except Exception:
+            pass
+        resolved = trader.resolve_trade(trade.id, result)
         if resolved:
-            self.dashboard.log(f"RESOLVIDO {resolved.id}: {trader.name} {resolved.direction} | {'WIN' if result > 0 else 'LOSS'} ${result:+.2f}")
+            self.dashboard.log(f"RESOLVIDO {resolved.id}: {name} {resolved.direction} | {'WIN' if result > 0 else 'LOSS'} ${result:+.2f} (px {op['entry_px']:.2f}->{exit_px:.2f})")
     
     def run(self):
         """Synchronous entry point - creates and runs event loop"""
@@ -978,7 +1072,7 @@ tr:hover td{background:#141e31}
 <table id="traders"><thead></thead><tbody></tbody></table>
 <h1 style="font-size:14px;margin-bottom:8px">OPERACOES (ULTIMAS 50)</h1>
 <table id="ops"><thead></thead><tbody></tbody></table>
-<h1 style="font-size:14px;margin-bottom:8px">POSICOES OKX</h1>
+<h1 style="font-size:14px;margin-bottom:8px">OPERACOES ABERTAS (EXECUCAO REAL)</h1>
 <table id="pos"><thead></thead><tbody></tbody></table>
 <h1 style="font-size:14px;margin-bottom:8px">LOGS &amp; SINAIS</h1>
 <div class="logs" id="logs"></div>
@@ -1014,7 +1108,7 @@ async function refresh(){
     document.getElementById('traders').innerHTML=`<thead><tr><th>#</th><th>TRADER</th><th>PAR</th><th>BET</th><th>EXP</th><th>ST</th><th>WINS</th><th>LOSSES</th><th>WR%</th><th>P&L</th><th>STREAK</th></tr></thead><tbody>`+s.traders.map((t,i)=>`<tr><td>${i+1}</td><td>${t.name}</td><td>${t.pair}</td><td>$${fmt(t.bet_size)}</td><td>${t.expiration}s</td><td><span class="pill ${t.enabled?'on':'off'}">${t.enabled?'ON':'OFF'}</span></td><td class="pos">${t.wins}</td><td class="neg">${t.losses}</td><td class="${t.win_rate>=60?'pos':(t.win_rate>=50?'neu':'neg')}">${t.win_rate}%</td><td>${pnl(t.total_pnl)}</td><td class="${cls(t.current_streak)}">${t.current_streak?((t.current_streak>0?'+':'')+t.current_streak+' '+t.streak_type):'--'}</td></tr>`).join('')+`</tbody>`;
     document.getElementById('ops').innerHTML=`<thead><tr><th>HORA</th><th>TRADER</th><th>PAR</th><th>DIR</th><th>BET</th><th>PROB</th><th>RESULTADO</th><th>ST</th><th>P&L ACC</th></tr></thead><tbody>`+(s.operations.length?s.operations.slice().reverse().map(o=>`<tr><td>${o.timestamp}</td><td>${o.trader}</td><td>${o.pair}</td><td class="${o.direction==='CALL'?'pos':'neg'}">${o.direction==='CALL'?'▲ CALL':'▼ PUT'}</td><td>$${fmt(o.bet)}</td><td>${fmt(o.probability)}</td><td>${o.result==null?'--':pnl(o.result)}</td><td><span class="pill ${o.status==='WIN'?'win':(o.status==='LOSS'?'loss':'w8')}">${o.status==='Aguardando'?'AGUARDANDO':o.status}</span></td><td>${pnl(o.cumulative_pnl)}</td></tr>`).join(''):`<tr><td colspan="9" style="color:#64748b">Aguardando operacoes...</td></tr>`)+`</tbody>`;
     const pos=(s.positions||[]);
-    document.getElementById('pos').innerHTML=`<thead><tr><th>SIMBOLO</th><th>LADO</th><th>TAM</th><th>ENTRADA</th><th>MARK</th><th>P&L NAO REALIZADO</th></tr></thead><tbody>`+(pos.length?pos.map(p=>`<tr><td>${p.symbol}</td><td class="${p.side==='long'?'pos':'neg'}">${p.side.toUpperCase()}</td><td>${p.size}</td><td>$${fmt(p.entry_price)}</td><td>$${fmt(p.mark_price)}</td><td>${pnl(p.unrealized_pnl)}</td></tr>`).join(''):`<tr><td colspan="6" style="color:#64748b">Nenhuma posicao aberta</td></tr>`)+`</tbody>`;
+    document.getElementById('pos').innerHTML=`<thead><tr><th>TRADER</th><th>SIMBOLO</th><th>LADO</th><th>TAMANHO</th><th>ENTRADA</th><th>ABERTA EM</th></tr></thead><tbody>`+(pos.length?pos.map(p=>`<tr><td>${p.trader}</td><td>${p.symbol}</td><td class="${p.side==='buy'?'pos':'neg'}">${p.side==='buy'?'▲ COMPRA':'▼ VENDA'}</td><td>${p.size}</td><td>$${fmt(p.entry_price)}</td><td>${p.opened_at||'--'}</td></tr>`).join(''):`<tr><td colspan="6" style="color:#64748b">Nenhuma operacao aberta (aguardando sinal)</td></tr>`)+`</tbody>`;
     document.getElementById('logs').innerHTML=(s.logs||[]).map(l=>`<div>${l.replace(/Analisando|SINAL|RESOLVIDO|Erro/g,'<b>$&</b>')}</div>`).join('')||'<div>sem logs</div>';
   }catch(e){
     document.getElementById('live').className='off';
@@ -1056,6 +1150,15 @@ setInterval(refresh,3000);refresh();
                       "askPx": t.get("askPx"), "open24h": t.get("open24h")}
                 for sym, t in term.okx_trader.market_data.items()
             }
+        # Operacoes abertas (ordens reais aguardando fechamento)
+        state["positions"] = []
+        for nm, op in term._open.items():
+            state["positions"].append({
+                "trader": nm, "symbol": op.get("symbol"),
+                "side": op.get("side"), "size": op.get("qty"),
+                "entry_price": op.get("entry_px"),
+                "opened_at": op.get("opened_at")
+            })
         ops = []
         for name, tr in dash.traders.items():
             for td in tr.trades:
