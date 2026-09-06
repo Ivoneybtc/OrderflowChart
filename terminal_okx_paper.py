@@ -1045,8 +1045,8 @@ class OKXPaperTerminal:
                 atr = 0.0
                 if len(data) >= 16:
                     fechados = list(reversed(data[1:]))
-                    candles = [{"h": float(c[2]), "l": float(c[3]), "c": float(c[4])}
-                               for c in fechados]
+                    candles = [{"o": float(c[1]), "h": float(c[2]), "l": float(c[3]),
+                                "c": float(c[4])} for c in fechados]
                     atrs = self._atr14(candles)
                     atr = atrs[-1] if atrs else 0.0
                 if atr <= 0:
