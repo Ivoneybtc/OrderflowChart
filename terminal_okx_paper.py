@@ -241,6 +241,39 @@ class OKXPaperTrader:
             return None
         return {"avg_px": avg_px, "fee": fee, "fill_sz": fill_sz,
                 "fill_ccy": f.get("fillCcy") or ""}
+
+    async def paper_place_limit(self, symbol: str, side: str, size: float,
+                                limit_px: float, signal_info: str = "") -> Dict:
+        """Ordem LIMIT real na OKX demo (spot, cash). size em ativo base."""
+        body = {
+            "instId": symbol, "tdMode": "cash", "side": side,
+            "ordType": "limit", "sz": str(size), "px": str(limit_px),
+        }
+        resp = await self._request("POST", "/api/v5/trade/order", body=body)
+        if resp.get("code") != "0":
+            return {"ok": False, "error": resp.get("msg") or resp.get("code") or "erro"}
+        return {"ok": True, "ord_id": resp["data"][0]["ordId"]}
+
+    async def get_order_state(self, symbol: str, ord_id: str) -> Optional[Dict]:
+        resp = await self._request("GET", f"/api/v5/trade/order?instId={symbol}&ordId={ord_id}")
+        data = resp.get("data") or []
+        if not data:
+            return None
+        o = data[0]
+        try:
+            return {
+                "state": o.get("state"),
+                "avg_px": float(o.get("avgPx") or 0),
+                "fee": float(o.get("fee") or 0),
+                "filled_sz": float(o.get("accFillSz") or 0),
+            }
+        except (TypeError, ValueError):
+            return {"state": o.get("state"), "avg_px": 0.0, "fee": 0.0, "filled_sz": 0.0}
+
+    async def cancel_order(self, symbol: str, ord_id: str) -> bool:
+        resp = await self._request("POST", "/api/v5/trade/cancel",
+                                   body={"instId": symbol, "ordId": ord_id})
+        return resp.get("code") == "0"
     
     def update_mark_prices(self):
         for key, pos in self.positions.items():
@@ -707,6 +740,23 @@ class OKXPaperTerminal:
         # specs spot por simbolo (lotSz/minSz) e operacoes abertas
         self.lot_sizes: Dict[str, Dict] = {}
         self._open: Dict[str, Dict] = {}
+        # ===== V2 orderflow engine =====
+        self.engine = None
+        self.engine_task = None
+        self.sym_trader: Dict[str, str] = {}       # okx_symbol -> nome do trader
+        self.zone_state: Dict[str, Dict] = {}      # symbol -> maquina de estados
+        self.v2_config = {
+            "threshold": float(os.environ.get("V2_THRESHOLD", "2.0")),
+            "min_levels": int(os.environ.get("V2_MIN_LEVELS", "3")),
+            "min_denom_frac": float(os.environ.get("V2_MIN_DENOM", "0.002")),
+            "ema_period": int(os.environ.get("V2_EMA", "12")),
+            "candle_seconds": int(os.environ.get("V2_CANDLE_SECS", "300")),
+            "retest_timeout": int(os.environ.get("V2_RETEST_TIMEOUT", "120")),
+            "pos_timeout": int(os.environ.get("V2_POS_TIMEOUT", "300")),
+            "rr": float(os.environ.get("V2_RR", "2.0")),
+            "stop_buffer_pct": float(os.environ.get("V2_STOP_BUFFER", "0.0004")),
+            "cooldown": int(os.environ.get("V2_COOLDOWN", "90")),
+        }
     
     async def initialize(self):
         self.okx_trader = OKXPaperTrader(
@@ -756,180 +806,215 @@ class OKXPaperTerminal:
                 self.okx_trader.market_data[symbol] = ticker["data"][0]
     
     async def check_signals(self):
-        """Check for stacked imbalance signals using OrderFlowChart and execute paper trades"""
-        for name, trader in self.dashboard.traders.items():
-            if not trader.enabled:
-                continue
-            
-            symbol = trader.okx_symbol
-            
-            # Skip if already has pending trade
-            if trader.pending > 0:
-                continue
-            
+        """Loop V2 (a cada ~2s): monitora retests e posicoes abertas (stop/alvo/tempo)."""
+        if not self.engine:
+            return
+        now = time.time()
+        for sym, st in list(self.zone_state.items()):
             try:
-                # Get orderbook depth (bid/ask levels) from OKX
-                orderbook = await self.okx_trader._request("GET", 
-                    f"/api/v5/market/books?instId={symbol}&sz=50")
-                
-                if "data" not in orderbook or not orderbook["data"]:
-                    self.dashboard.log(f"Sem orderbook para {symbol}")
-                    continue
-                
-                ob = orderbook["data"][0]
-                ts = int(ob["ts"])
-                ts_dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
-                
-                # Get recent trades for OHLC
-                trades_resp = await self.okx_trader._request("GET",
-                    f"/api/v5/market/trades?instId={symbol}&limit=100")
-                
-                if "data" not in trades_resp or not trades_resp["data"]:
-                    self.dashboard.log(f"Sem trades para {symbol}")
-                    continue
-                
-                self.dashboard.log(f"Analisando {symbol}: {len(ob['bids'])} bids, {len(ob['asks'])} asks, {len(trades_resp['data'])} trades")
-                
-                # Build orderflow dataframe from orderbook + trades
-                # Create a unique identifier for current candle (1-minute)
-                candle_ts = int(ts_dt.timestamp() // 60) * 60
-                candle_id = f"candle_{candle_ts}"
-                
-                # Build orderflow rows from orderbook
-                rows = []
-                for bid_price, bid_sz, *_ in ob["bids"][:50]:
-                    rows.append({
-                        "bid_size": float(bid_sz),
-                        "price": float(bid_price),
-                        "ask_size": 0.0,
-                        "identifier": candle_id
-                    })
-                
-                for ask_price, ask_sz, *_ in ob["asks"][:50]:
-                    rows.append({
-                        "bid_size": 0.0,
-                        "price": float(ask_price),
-                        "ask_size": float(ask_sz),
-                        "identifier": candle_id
-                    })
-                
-                if not rows:
-                    continue
-                
-                df_of = pd.DataFrame(rows)
-                df_of["timestamp"] = ts_dt
-                df_of = df_of.set_index("timestamp")
-                
-                # Build OHLC from recent trades
-                trade_list = trades_resp["data"]
-                if not trade_list:
-                    continue
-                
-                prices = [float(t["px"]) for t in trade_list]
-                volumes = [float(t["sz"]) for t in trade_list]
-                
-                ohlc_row = {
-                    "identifier": candle_id,
-                    "open": prices[-1],   # oldest
-                    "high": max(prices),
-                    "low": min(prices),
-                    "close": prices[0],   # newest
-                    "volume": sum(volumes),
-                    "timestamp": datetime.fromtimestamp(candle_ts, tz=timezone.utc)
-                }
-                df_ohlc = pd.DataFrame([ohlc_row]).set_index("timestamp")
-                
-                # Use OrderFlowChart to detect stacked imbalances
-                from OrderFlow import OrderFlowChart
-                chart = OrderFlowChart(
-                    df_of, df_ohlc, identifier_col="identifier",
-                    stacked_threshold=3.0,
-                    stacked_min_levels=3,
-                    show_stacked=True
-                )
-                
-                fig = chart.plot(return_figure=True)
-                summary = chart.stacked_summary
-                
-                if summary is None or summary.empty:
-                    self.dashboard.log(f"{symbol}: Sem stacked imbalances")
-                    continue
-                
-                # Check for stacked imbalances in current candle
-                current_stacks = summary[summary["identifier"] == candle_id]
-                if current_stacks.empty:
-                    self.dashboard.log(f"{symbol}: Sem stacked no candle atual")
-                    continue
-                
-                # Find strongest stacked imbalance
-                strongest = current_stacks.loc[current_stacks["avg_ratio"].idxmax()]
-                direction = "CALL" if strongest["direction"] == "buy" else "PUT"
-                prob = min(0.95, 0.55 + (strongest["avg_ratio"] - 3.0) * 0.1)
-
-                signal_info = f"Stacked {strongest['direction']} {int(strongest['levels'])}x @ {strongest['avg_ratio']:.1f}x | Price {strongest['price_min']:.2f}-{strongest['price_max']:.2f}"
-
-                # ===== Execucao REAL na OKX demo (spot) =====
-                # 1) preco atual para converter bet ($) em quantidade do ativo
-                ticker = self.okx_trader.market_data.get(symbol)
-                if not ticker or not float(ticker.get("last") or 0):
-                    t = await self.okx_trader._request("GET", f"/api/v5/market/ticker?instId={symbol}")
-                    tdata = t.get("data") or [{}]
-                    if tdata:
-                        self.okx_trader.market_data[symbol] = tdata[0]
-                        ticker = tdata[0]
-                last_px = float((ticker or {}).get("last") or 0)
-                if last_px <= 0:
-                    self.dashboard.log(f"{symbol}: sem preco de mercado para dimensionar ordem")
-                    continue
-
-                side = "buy" if direction == "CALL" else "sell"
-                raw_qty = trader.bet_size / last_px
-                qty = self._round_spot_qty(symbol, raw_qty)
-                if qty <= 0:
-                    self.dashboard.log(f"{symbol}: valor {trader.bet_size} abaixo do minimo spot")
-                    continue
-
-                # PUT em spot exige ter o ativo na conta demo
-                if side == "sell":
-                    base_ccy = symbol.split("-")[0]
-                    try:
-                        b = await self.okx_trader._request("GET", f"/api/v5/account/balance?ccy={base_ccy}")
-                        det = ((b.get("data") or [{}])[0].get("details") or [{}])[0]
-                        have = float(det.get("availBal") or 0)
-                    except Exception:
-                        have = 0.0
-                    if have < qty:
-                        self.dashboard.log(f"{symbol}: sem {base_ccy} suficiente p/ PUT (tem {have:.6f}, precisa {qty:.6f})")
-                        continue
-
-                # CALL (buy): ordem market em USDT (quote) = valor exato da bet.
-                # PUT (sell): ordem market em BTC (base) = quantidade calculada.
-                if side == "buy":
-                    resp = await self.okx_trader.paper_place_order(symbol, side, trader.bet_size, signal_info=signal_info)
-                else:
-                    resp = await self.okx_trader.paper_place_order(symbol, side, qty, signal_info=signal_info)
-                if not resp.get("ok"):
-                    self.dashboard.log(f"{symbol} {direction}: ordem rejeitada: {str(resp.get('error'))[:70]}")
-                    continue
-
-                # 2) ordem preenchida de verdade -> registra trade (qty real do fill)
-                trade = trader.add_trade(direction, prob, signal_info=signal_info)
-                filled_qty = float(resp.get("fill_sz") or qty or 0)
-                if filled_qty <= 0:
-                    filled_qty = qty
-                self._open[trader.name] = {
-                    "trade_id": trade.id, "side": side, "qty": filled_qty,
-                    "entry_px": resp["avg_px"], "fee_open": resp["fee"],
-                    "symbol": symbol, "opened_at": datetime.now(timezone.utc).strftime("%H:%M:%S")
-                }
-                self.dashboard.log(f"SINAL {trade.id}: {name} {trader.pair} {direction} @ {prob:.2f} | {signal_info} | exec {side} {filled_qty} @ {resp['avg_px']:.2f}")
-
-                # 3) fecha apos a expiracao e resolve com P&L REAL
-                asyncio.create_task(self._auto_resolve(trader, trade, side, filled_qty))
-                
+                if st["state"] == "RETEST":
+                    await self._check_retest(sym, st, now)
+                elif st["state"] == "IN_POS":
+                    await self._check_position(sym, st, now)
             except Exception as e:
-                self.dashboard.log(f"Erro analise {name}: {str(e)[:60]}")
-    
+                self.dashboard.log(f"Erro monitor {sym}: {str(e)[:60]}")
+
+    async def _check_retest(self, sym: str, st: dict, now: float):
+        if not st.get("ord_id"):
+            st["state"] = "IDLE"
+            return
+        cfg = self.v2_config
+        if now - st["t0"] > cfg["retest_timeout"]:
+            await self.okx_trader.cancel_order(sym, st["ord_id"])
+            self.dashboard.log(f"{self.sym_trader.get(sym, sym)}: retest expirou - ordem cancelada")
+            st["state"] = "IDLE"
+            st["ord_id"] = None
+            return
+        info = await self.okx_trader.get_order_state(sym, st["ord_id"])
+        if not info:
+            return
+        if info["state"] == "filled":
+            st["ord_id"] = None
+            await self._enter_position(sym, st, info["avg_px"], info["fee"])
+        elif info["state"] in ("canceled", "cancelled"):
+            st["state"] = "IDLE"
+            st["ord_id"] = None
+
+    async def _enter_position(self, sym: str, st: dict, avg_px: float, fee: float):
+        cfg = self.v2_config
+        zone = st["zone"]
+        side = st["side"]
+        st["state"] = "IN_POS"
+        st["entry_px"] = avg_px
+        st["fee_open"] = fee
+        st["opened_at"] = time.time()
+        if side == "buy":
+            st["stop_px"] = round(zone.price_min * (1 - cfg["stop_buffer_pct"]), 8)
+        else:
+            st["stop_px"] = round(zone.price_max * (1 + cfg["stop_buffer_pct"]), 8)
+        risk = abs(avg_px - st["stop_px"])
+        if side == "buy":
+            st["target_px"] = round(avg_px + risk * cfg["rr"], 8)
+        else:
+            st["target_px"] = round(avg_px - risk * cfg["rr"], 8)
+        name = self.sym_trader.get(sym, sym)
+        trader = self.dashboard.traders.get(name)
+        direction = "CALL" if side == "buy" else "PUT"
+        sig = f"Zona {zone.direction} {zone.levels}x ~{zone.avg_ratio}x {zone.price_min}-{zone.price_max}"
+        trade = trader.add_trade(direction, 0.0, signal_info=sig) if trader else None
+        st["trade_id"] = trade.id if trade else None
+        self.dashboard.log(
+            f"ENTRADA {name} {direction} {st['qty']} @ {avg_px:.2f} | stop {st['stop_px']:.2f} | alvo {st['target_px']:.2f}")
+
+    async def _check_position(self, sym: str, st: dict, now: float):
+        px = self.engine.last_price.get(sym)
+        if not px:
+            return
+        cfg = self.v2_config
+        if now - st["opened_at"] > cfg["pos_timeout"]:
+            await self._close_position(sym, st, "timeout")
+            return
+        side = st["side"]
+        if side == "buy":
+            if px <= st["stop_px"]:
+                await self._close_position(sym, st, "stop")
+            elif px >= st["target_px"]:
+                await self._close_position(sym, st, "alvo")
+        else:
+            if px >= st["stop_px"]:
+                await self._close_position(sym, st, "stop")
+            elif px <= st["target_px"]:
+                await self._close_position(sym, st, "alvo")
+
+    async def _close_position(self, sym: str, st: dict, motivo: str):
+        side = st["side"]
+        qty = st["qty"]
+        close_side = "sell" if side == "buy" else "buy"
+        if close_side == "buy":
+            resp = await self.okx_trader.paper_place_order(sym, close_side, qty, tgt_ccy="base_ccy")
+        else:
+            resp = await self.okx_trader.paper_place_order(sym, close_side, qty)
+        if not resp.get("ok"):
+            self.dashboard.log(f"{sym}: fechamento ({motivo}) falhou: {resp.get('error')} - nova tentativa em 3s")
+            await asyncio.sleep(3)
+            if close_side == "buy":
+                resp = await self.okx_trader.paper_place_order(sym, close_side, qty, tgt_ccy="base_ccy")
+            else:
+                resp = await self.okx_trader.paper_place_order(sym, close_side, qty)
+        if not resp.get("ok"):
+            self.dashboard.log(f"{sym}: posicao NAO fechada ({motivo}) - requer atencao")
+            return
+        exit_px = resp["avg_px"]
+        fees = abs(st.get("fee_open") or 0) + abs(resp.get("fee") or 0)
+        if side == "buy":
+            result = round((exit_px - st["entry_px"]) * qty - fees, 2)
+        else:
+            result = round((st["entry_px"] - exit_px) * qty - fees, 2)
+        name = self.sym_trader.get(sym, sym)
+        trader = self.dashboard.traders.get(name)
+        if trader and st.get("trade_id"):
+            resolved = trader.resolve_trade(st["trade_id"], result)
+        try:
+            self.okx_trader.account.balance = round((self.okx_trader.account.balance or 0) + result, 2)
+            self.okx_trader.account.available = max(0.0, round((self.okx_trader.account.available or 0) + result, 2))
+        except Exception:
+            pass
+        self.dashboard.log(
+            f"FECHADO {name} [{motivo.upper()}] {'WIN' if result > 0 else 'LOSS'} ${result:+.2f} "
+            f"({st['entry_px']:.2f}->{exit_px:.2f})")
+        st["state"] = "IDLE"
+        st["ord_id"] = None
+        st["cooldown_until"] = time.time() + self.v2_config["cooldown"]
+
+    async def _on_candle_close(self, candle):
+        """Candle de 1min fechado: detecta zonas e tenta entrada no retest."""
+        try:
+            from orderflow_engine import detect_stacked_zones
+        except ImportError:
+            return
+        cfg = self.v2_config
+        sym = candle.symbol
+        st = self.zone_state.get(sym)
+        if not st:
+            return
+        self.dashboard.log(
+            f"Candle {sym}: {candle.trades} trades | delta {candle.delta():+.4f} | buy {candle.buy_vol:.4f} sell {candle.sell_vol:.4f}")
+        zones = detect_stacked_zones(candle, threshold=cfg["threshold"],
+                                     min_levels=cfg["min_levels"],
+                                     min_denom_frac=cfg["min_denom_frac"])
+        for z in zones:
+            self.dashboard.log(
+                f"ZONA {sym} {z.direction.upper()} {z.levels}lv ~{z.avg_ratio}x "
+                f"{z.price_min:.2f}-{z.price_max:.2f} | delta {candle.delta():+.4f}")
+        if not zones or st["state"] != "IDLE":
+            return
+        if time.time() < st.get("cooldown_until", 0):
+            return
+        zones.sort(key=lambda z: (z.levels, z.avg_ratio), reverse=True)
+        zone = zones[0]
+        px = self.engine.last_price.get(sym)
+        if not px:
+            return
+        # filtro de tendencia: continuacao exige alinhamento com EMA(curto prazo)
+        ema = self.engine.ema(sym, cfg["ema_period"])
+        if ema is None:
+            self.dashboard.log(f"{sym}: aguardando EMA ({len(self.engine.close_history.get(sym) or [])}/{cfg['ema_period']} candles)")
+            return
+        if zone.direction == "buy" and px < ema:
+            self.dashboard.log(f"{sym}: zona BUY sem alinhamento (px {px:.2f} < EMA {ema:.2f}) - descartada")
+            return
+        if zone.direction == "sell" and px > ema:
+            self.dashboard.log(f"{sym}: zona SELL sem alinhamento (px {px:.2f} > EMA {ema:.2f}) - descartada")
+            return
+        await self._try_open_retest(sym, st, zone, px)
+
+    async def _try_open_retest(self, sym: str, st: dict, zone, px: float):
+        name = self.sym_trader.get(sym, sym)
+        trader = self.dashboard.traders.get(name)
+        if not trader:
+            return
+        cfg = self.v2_config
+        side = "buy" if zone.direction == "buy" else "sell"
+        if side == "buy":
+            limit_px = zone.price_min
+            if px <= limit_px:
+                self.dashboard.log(f"{sym}: zona BUY ja quebrada (px {px:.2f} <= {limit_px:.2f})")
+                return
+        else:
+            limit_px = zone.price_max
+            if px >= limit_px:
+                self.dashboard.log(f"{sym}: zona SELL ja quebrada (px {px:.2f} >= {limit_px:.2f})")
+                return
+        info = self.lot_sizes.get(sym) or {}
+        try:
+            tick_sz = float(info.get("tickSz") or 0.1)
+        except (TypeError, ValueError):
+            tick_sz = 0.1
+        limit_px = round(limit_px / tick_sz) * tick_sz
+        qty = self._round_spot_qty(sym, trader.bet_size / limit_px)
+        if qty <= 0:
+            return
+        # PUT (sell) em spot exige ter o ativo
+        if side == "sell":
+            base_ccy = sym.split("-")[0]
+            try:
+                b = await self.okx_trader._request("GET", f"/api/v5/account/balance?ccy={base_ccy}")
+                det = ((b.get("data") or [{}])[0].get("details") or [{}])[0]
+                have = float(det.get("availBal") or 0)
+            except Exception:
+                have = 0.0
+            if have < qty:
+                self.dashboard.log(f"{sym}: sem {base_ccy} p/ PUT ({have:.6f} < {qty:.6f})")
+                return
+        resp = await self.okx_trader.paper_place_limit(sym, side, qty, limit_px)
+        if not resp.get("ok"):
+            self.dashboard.log(f"{sym}: ordem limit rejeitada: {resp.get('error')}")
+            return
+        st.update({"state": "RETEST", "ord_id": resp["ord_id"], "zone": zone,
+                   "side": side, "qty": qty, "t0": time.time()})
+        self.dashboard.log(
+            f"{name}: retest {side} {qty} @ limit {limit_px:.2f} (zona {zone.price_min:.2f}-{zone.price_max:.2f})")
+
     def _round_spot_qty(self, symbol: str, qty: float) -> float:
         """Arredonda para baixo ao multiplo do lote minimo do par spot."""
         import math
@@ -941,51 +1026,6 @@ class OKXPaperTerminal:
         if lot <= 0:
             lot = 1e-8
         return round(math.floor(qty / lot) * lot, 12)
-    
-    async def _auto_resolve(self, trader: Trader, trade, side: str, qty: float):
-        await asyncio.sleep(trader.expiration)
-        name = trader.name
-        op = self._open.pop(name, None)
-        if not op:
-            return
-        symbol = op.get("symbol") or trader.okx_symbol
-        close_side = "sell" if side == "buy" else "buy"
-        # Fechamento: CALL -> vende o BTC comprado (sz base). PUT -> recompra o BTC (tgtCcy=base_ccy).
-        if close_side == "sell":
-            resp = await self.okx_trader.paper_place_order(symbol, close_side, qty)
-        else:
-            resp = await self.okx_trader.paper_place_order(symbol, close_side, qty, tgt_ccy="base_ccy")
-        if not resp.get("ok"):
-            self.dashboard.log(f"{name}: falha ao fechar ({resp.get('error')}) - tentando de novo")
-            await asyncio.sleep(5)
-            if close_side == "sell":
-                resp = await self.okx_trader.paper_place_order(symbol, close_side, qty)
-            else:
-                resp = await self.okx_trader.paper_place_order(symbol, close_side, qty, tgt_ccy="base_ccy")
-        if not resp.get("ok"):
-            self.dashboard.log(f"{name}: posicao NAO fechada ({resp.get('error')}) - atencao")
-            self._open[name] = op
-            return
-        # P&L real: diferenca de preco x quantidade - fees (ambos os lados)
-        exit_px = resp["avg_px"]
-        fee_close = abs(resp.get("fee") or 0)
-        fee_open = abs(op.get("fee_open") or 0)
-        if side == "buy":      # comprou e vendeu (long)
-            gross = (exit_px - op["entry_px"]) * qty
-        else:                   # vendeu e recomprou (short)
-            gross = (op["entry_px"] - exit_px) * qty
-        result = round(gross - fee_open - fee_close, 2)
-        try:
-            self.okx_trader.account.balance = round(
-                (self.okx_trader.account.balance or 0) + result, 2)
-            self.okx_trader.account.available = max(
-                0.0, round((self.okx_trader.account.available or 0) + result, 2))
-        except Exception:
-            pass
-        resolved = trader.resolve_trade(trade.id, result)
-        if resolved:
-            self.dashboard.log(f"RESOLVIDO {resolved.id}: {name} {resolved.direction} | {'WIN' if result > 0 else 'LOSS'} ${result:+.2f} (px {op['entry_px']:.2f}->{exit_px:.2f})")
-    
     def run(self):
         """Synchronous entry point - creates and runs event loop"""
         # Create and run event loop
@@ -1019,6 +1059,36 @@ class OKXPaperTerminal:
         print(f"OKX Paper Trading conectado - {len(self.dashboard.traders)} traders")
         print("Dashboard rodando... Ctrl+C para sair\n")
 
+        # ===== V2: inicia o feed de footprint (trades com lado agressor) =====
+        try:
+            from orderflow_engine import FootprintFeed
+            symbols = [t.okx_symbol for t in self.dashboard.traders.values()]
+            self.sym_trader = {t.okx_symbol: name for name, t in self.dashboard.traders.items()}
+            for s in symbols:
+                self.zone_state[s] = {
+                    "state": "IDLE", "ord_id": None, "zone": None, "t0": 0,
+                    "cooldown_until": 0, "entry_px": 0.0, "qty": 0.0,
+                    "side": None, "stop_px": 0.0, "target_px": 0.0,
+                    "trade_id": None, "opened_at": 0,
+                }
+            self.engine = FootprintFeed(symbols, candle_seconds=self.v2_config["candle_seconds"],
+                                        on_candle_close=self._on_candle_close)
+            self.engine_task = asyncio.create_task(self.engine.run())
+            # pre-carrega closes historicos p/ a EMA iniciar pronta (sem warm-up a cada restart)
+            try:
+                for sym in symbols:
+                    r = await self.okx_trader._request(
+                        "GET", f"/api/v5/market/history-candles?instId={sym}&bar=5m&limit=60")
+                    hist = r.get("data") or []
+                    for c in reversed(hist):  # mais antigo -> mais recente
+                        self.engine.close_history.setdefault(sym, []).append(float(c[4]))
+                    self.dashboard.log(f"Historico {sym}: {len(hist)} closes 5m carregados p/ EMA")
+            except Exception as e:
+                self.dashboard.log(f"Historico p/ EMA falhou: {e}")
+            self.dashboard.log(f"Engine V2 (footprint real) iniciado - candle {self.v2_config['candle_seconds']}s")
+        except Exception as e:
+            self.dashboard.log(f"Engine V2 falhou ao iniciar: {e}")
+
         # Web dashboard acessivel pelo navegador (porta $PORT na Railway)
         try:
             self.web = WebDashboard(self)
@@ -1026,7 +1096,17 @@ class OKXPaperTerminal:
         except Exception as e:
             print(f"Web dashboard nao iniciado: {e}")
 
-        await self.dashboard.run_async(self.okx_trader, self.check_signals)
+        try:
+            await self.dashboard.run_async(self.okx_trader, self.check_signals)
+        finally:
+            if self.engine:
+                self.engine.stop()
+            if self.engine_task:
+                self.engine_task.cancel()
+                try:
+                    await self.engine_task
+                except (asyncio.CancelledError, Exception):
+                    pass
         
         await self.okx_trader.close()
 
@@ -1103,12 +1183,13 @@ async function refresh(){
     document.getElementById('market').innerHTML=Object.keys(s.market||{}).map(sym=>{
       const m=mk(sym);const l=parseFloat(m.last),o=parseFloat(m.open24h);
       const ch=o?((l-o)/o*100):null;
-      return `<span class="mkt"><span class="sym">${sym}</span> ${fmt(m.last)} <span class="${cls(ch)}">${ch==null?'':(ch>0?'+':'')+fmt(ch)+'%'}</span></span>`;
+      const dl=m.delta;
+      return `<span class="mkt"><span class="sym">${sym}</span> ${fmt(m.last)} <span class="${cls(ch)}">${ch==null?'':(ch>0?'+':'')+fmt(ch)+'%'}</span> ${dl==null?'':`<span class="${cls(dl)}">Δ ${dl>0?'+':''}${fmt(dl)}</span>`}</span>`;
     }).join('');
     document.getElementById('traders').innerHTML=`<thead><tr><th>#</th><th>TRADER</th><th>PAR</th><th>BET</th><th>EXP</th><th>ST</th><th>WINS</th><th>LOSSES</th><th>WR%</th><th>P&L</th><th>STREAK</th></tr></thead><tbody>`+s.traders.map((t,i)=>`<tr><td>${i+1}</td><td>${t.name}</td><td>${t.pair}</td><td>$${fmt(t.bet_size)}</td><td>${t.expiration}s</td><td><span class="pill ${t.enabled?'on':'off'}">${t.enabled?'ON':'OFF'}</span></td><td class="pos">${t.wins}</td><td class="neg">${t.losses}</td><td class="${t.win_rate>=60?'pos':(t.win_rate>=50?'neu':'neg')}">${t.win_rate}%</td><td>${pnl(t.total_pnl)}</td><td class="${cls(t.current_streak)}">${t.current_streak?((t.current_streak>0?'+':'')+t.current_streak+' '+t.streak_type):'--'}</td></tr>`).join('')+`</tbody>`;
     document.getElementById('ops').innerHTML=`<thead><tr><th>HORA</th><th>TRADER</th><th>PAR</th><th>DIR</th><th>BET</th><th>PROB</th><th>RESULTADO</th><th>ST</th><th>P&L ACC</th></tr></thead><tbody>`+(s.operations.length?s.operations.slice().reverse().map(o=>`<tr><td>${o.timestamp}</td><td>${o.trader}</td><td>${o.pair}</td><td class="${o.direction==='CALL'?'pos':'neg'}">${o.direction==='CALL'?'▲ CALL':'▼ PUT'}</td><td>$${fmt(o.bet)}</td><td>${fmt(o.probability)}</td><td>${o.result==null?'--':pnl(o.result)}</td><td><span class="pill ${o.status==='WIN'?'win':(o.status==='LOSS'?'loss':'w8')}">${o.status==='Aguardando'?'AGUARDANDO':o.status}</span></td><td>${pnl(o.cumulative_pnl)}</td></tr>`).join(''):`<tr><td colspan="9" style="color:#64748b">Aguardando operacoes...</td></tr>`)+`</tbody>`;
     const pos=(s.positions||[]);
-    document.getElementById('pos').innerHTML=`<thead><tr><th>TRADER</th><th>SIMBOLO</th><th>LADO</th><th>TAMANHO</th><th>ENTRADA</th><th>ABERTA EM</th></tr></thead><tbody>`+(pos.length?pos.map(p=>`<tr><td>${p.trader}</td><td>${p.symbol}</td><td class="${p.side==='buy'?'pos':'neg'}">${p.side==='buy'?'▲ COMPRA':'▼ VENDA'}</td><td>${p.size}</td><td>$${fmt(p.entry_price)}</td><td>${p.opened_at||'--'}</td></tr>`).join(''):`<tr><td colspan="6" style="color:#64748b">Nenhuma operacao aberta (aguardando sinal)</td></tr>`)+`</tbody>`;
+    document.getElementById('pos').innerHTML=`<thead><tr><th>TRADER</th><th>SIMBOLO</th><th>LADO</th><th>TAMANHO</th><th>ENTRADA</th><th>STOP</th><th>ALVO</th><th>STATUS</th></tr></thead><tbody>`+(pos.length?pos.map(p=>`<tr><td>${p.trader}</td><td>${p.symbol}</td><td class="${p.side==='buy'?'pos':'neg'}">${p.side==='buy'?'▲ COMPRA':'▼ VENDA'}</td><td>${p.size}</td><td>${p.entry_price==null?'--':'$'+fmt(p.entry_price)}</td><td>${p.stop_px==null?'--':'$'+fmt(p.stop_px)}</td><td>${p.target_px==null?'--':'$'+fmt(p.target_px)}</td><td><span class="pill ${p.status==='ABERTA'?'win':'w8'}">${p.status}</span></td></tr>`).join(''):`<tr><td colspan="8" style="color:#64748b">Nenhuma operacao (aguardando zona de footprint)</td></tr>`)+`</tbody>`;
     document.getElementById('logs').innerHTML=(s.logs||[]).map(l=>`<div>${l.replace(/Analisando|SINAL|RESOLVIDO|Erro/g,'<b>$&</b>')}</div>`).join('')||'<div>sem logs</div>';
   }catch(e){
     document.getElementById('live').className='off';
@@ -1150,15 +1231,39 @@ setInterval(refresh,3000);refresh();
                       "askPx": t.get("askPx"), "open24h": t.get("open24h")}
                 for sym, t in term.okx_trader.market_data.items()
             }
-        # Operacoes abertas (ordens reais aguardando fechamento)
+        # delta do footprint (candle corrente) em USDT, por simbolo
+        if term.engine:
+            try:
+                for sym, es in term.engine.state().items():
+                    if sym in state["market"]:
+                        d = es.get("delta") or 0
+                        last = float(state["market"][sym].get("last") or 0)
+                        state["market"][sym]["delta"] = round(d * last, 2) if last else None
+            except Exception:
+                pass
+        # Operacoes V2: retests aguardando e posicoes abertas (stop/alvo)
         state["positions"] = []
-        for nm, op in term._open.items():
-            state["positions"].append({
-                "trader": nm, "symbol": op.get("symbol"),
-                "side": op.get("side"), "size": op.get("qty"),
-                "entry_price": op.get("entry_px"),
-                "opened_at": op.get("opened_at")
-            })
+        for sym, st in (term.zone_state or {}).items():
+            stt = st.get("state")
+            if stt in ("RETEST", "IN_POS"):
+                trader_nm = term.sym_trader.get(sym, sym)
+                if stt == "RETEST":
+                    state["positions"].append({
+                        "trader": trader_nm, "symbol": sym,
+                        "side": st.get("side"), "size": st.get("qty"),
+                        "entry_price": None, "opened_at": "retest",
+                        "stop_px": None, "target_px": None,
+                        "status": "RETEST",
+                    })
+                else:
+                    state["positions"].append({
+                        "trader": trader_nm, "symbol": sym,
+                        "side": st.get("side"), "size": st.get("qty"),
+                        "entry_price": st.get("entry_px"),
+                        "opened_at": datetime.fromtimestamp(st.get("opened_at") or 0).strftime("%H:%M:%S"),
+                        "stop_px": st.get("stop_px"), "target_px": st.get("target_px"),
+                        "status": "ABERTA",
+                    })
         ops = []
         for name, tr in dash.traders.items():
             for td in tr.trades:
