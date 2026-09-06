@@ -759,6 +759,20 @@ class OKXPaperTerminal:
         }
         self.paused: bool = False        # pause manual: nao abre novas entradas
         self._pause_announced: bool = False
+        # ===== V4: MOMENTUM MULTI-DIARIO (validado em backtest 33m/4 ativos) =====
+        self.v4_config = {
+            "lookback": int(os.environ.get("V4_LOOKBACK", "30")),
+            "thr": float(os.environ.get("V4_THR", "0.05")),
+            "k_atr": float(os.environ.get("V4_K_ATR", "2.0")),
+            "rr": float(os.environ.get("V4_RR", "2.0")),
+            "timeout_dias": int(os.environ.get("V4_TIMEOUT_DIAS", "20")),
+            "fracao": float(os.environ.get("V4_FRACAO", "0.25")),
+        }
+        self.posicoes: Dict[str, Optional[Dict]] = {}   # symbol -> posicao ativa (ou None)
+        self.ultimo_dia_checado: Optional[int] = None   # dia UTC ja processado
+        self._ultima_tentativa_diaria: float = 0.0
+        self._arquivo_posicoes = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "data", "posicoes_v4.json")
     
     async def initialize(self):
         self.okx_trader = OKXPaperTrader(
@@ -775,7 +789,8 @@ class OKXPaperTerminal:
         print(f"OKX Paper Trading conectado (Demo: True)")
 
         # Specs spot (lotSz/minSz) dos 4 pares - para converter $ em quantidade
-        for sym in ("BTC-USDT", "ETH-USDT", "BNB-USDT", "SOL-USDT"):
+        # (BNB-USDT nao e negociavel na demo: erro 51155 compliance -> DOGE no lugar)
+        for sym in ("BTC-USDT", "ETH-USDT", "DOGE-USDT", "SOL-USDT"):
             r = await self.okx_trader._request("GET", f"/api/v5/public/instruments?instType=SPOT&instId={sym}")
             d = (r.get("data") or [None])
             if d and d[0]:
@@ -807,247 +822,220 @@ class OKXPaperTerminal:
             if "data" in ticker and ticker["data"]:
                 self.okx_trader.market_data[symbol] = ticker["data"][0]
     
+    # ================= V4: MOMENTUM MULTI-DIARIO =================
+    # Validado em backtest (33 meses, 4 ativos, ~1.000 candles diarios):
+    # lookback 30d + sinal >= 5% + stop 2xATR14 + alvo 2:1 + timeout 20d
+    # -> PF 1.61 | MDD 9.8% | ~+26%/ano | robusto em 4/4 ativos e 3/3 tercos.
+
+    @staticmethod
+    def _dia_utc() -> int:
+        return int(time.time()) // 86400
+
+    @staticmethod
+    def _atr14(candles_asc: list) -> list:
+        """ATR de Wilder (14) sobre candles asc [{h,l,c},...]; lista por candle."""
+        n = len(candles_asc)
+        out = [0.0] * n
+        if n < 15:
+            return out
+        trs = []
+        for i, c in enumerate(candles_asc):
+            prev_c = candles_asc[i - 1]["c"] if i else c["o"]
+            trs.append(max(c["h"] - c["l"], abs(c["h"] - prev_c), abs(c["l"] - prev_c)))
+        out[14] = sum(trs[1:15]) / 14.0
+        for i in range(15, n):
+            out[i] = (out[i - 1] * 13 + trs[i]) / 14.0
+        return out
+
     async def check_signals(self):
-        """Loop V2 (a cada ~2s): monitora retests e posicoes abertas (stop/alvo/tempo)."""
-        if not self.engine:
-            return
-        now = time.time()
-        # pause: cancela retests pendentes e bloqueia novas entradas
-        # (posicoes JA abertas continuam gerenciadas: stop/alvo/timeout)
+        """V4: monitora posicoes (stop/alvo/timeout) + checagem diaria de entradas."""
         if self.paused:
-            for sym, st in list(self.zone_state.items()):
-                if st["state"] == "RETEST" and st.get("ord_id"):
-                    try:
-                        await self.okx_trader.cancel_order(sym, st["ord_id"])
-                    except Exception:
-                        pass
-                    st["state"] = "IDLE"
-                    st["ord_id"] = None
-                    self.dashboard.log(f"{self.sym_trader.get(sym, sym)}: retest cancelado (pause)")
             if not self._pause_announced:
                 self._pause_announced = True
                 self.dashboard.log("BOT PAUSADO - novas entradas bloqueadas (posicoes abertas seguem gerenciadas)")
         elif self._pause_announced:
             self._pause_announced = False
             self.dashboard.log("BOT ATIVO - novas entradas liberadas")
-        for sym, st in list(self.zone_state.items()):
+        for sym, pos in list((self.posicoes or {}).items()):
+            if pos:
+                try:
+                    await self._monitor_posicao(sym, pos)
+                except Exception as e:
+                    self.dashboard.log(f"Erro monitor {sym}: {str(e)[:60]}")
+        if not self.paused:
             try:
-                if st["state"] == "RETEST":
-                    await self._check_retest(sym, st, now)
-                elif st["state"] == "IN_POS":
-                    await self._check_position(sym, st, now)
+                await self._checagem_diaria()
             except Exception as e:
-                self.dashboard.log(f"Erro monitor {sym}: {str(e)[:60]}")
+                self.dashboard.log(f"Erro checagem diaria: {str(e)[:80]}")
 
-    async def _check_retest(self, sym: str, st: dict, now: float):
-        if not st.get("ord_id"):
-            st["state"] = "IDLE"
-            return
-        cfg = self.v2_config
-        if now - st["t0"] > cfg["retest_timeout"]:
-            await self.okx_trader.cancel_order(sym, st["ord_id"])
-            self.dashboard.log(f"{self.sym_trader.get(sym, sym)}: retest expirou - ordem cancelada")
-            st["state"] = "IDLE"
-            st["ord_id"] = None
-            return
-        info = await self.okx_trader.get_order_state(sym, st["ord_id"])
-        if not info:
-            return
-        if info["state"] == "filled":
-            st["ord_id"] = None
-            await self._enter_position(sym, st, info["avg_px"], info["fee"])
-        elif info["state"] in ("canceled", "cancelled"):
-            st["state"] = "IDLE"
-            st["ord_id"] = None
+    def _preco_atual(self, sym: str) -> Optional[float]:
+        if self.engine and self.engine.last_price.get(sym):
+            return self.engine.last_price[sym]
+        md = (self.okx_trader.market_data or {}).get(sym)
+        try:
+            return float(md.get("last") or 0) if md else None
+        except (TypeError, ValueError):
+            return None
 
-    async def _enter_position(self, sym: str, st: dict, avg_px: float, fee: float):
-        cfg = self.v2_config
-        zone = st["zone"]
-        side = st["side"]
-        st["state"] = "IN_POS"
-        st["entry_px"] = avg_px
-        st["fee_open"] = fee
-        st["opened_at"] = time.time()
-        if side == "buy":
-            st["stop_px"] = round(zone.price_min * (1 - cfg["stop_buffer_pct"]), 8)
-        else:
-            st["stop_px"] = round(zone.price_max * (1 + cfg["stop_buffer_pct"]), 8)
-        risk = abs(avg_px - st["stop_px"])
-        if side == "buy":
-            st["target_px"] = round(avg_px + risk * cfg["rr"], 8)
-        else:
-            st["target_px"] = round(avg_px - risk * cfg["rr"], 8)
-        name = self.sym_trader.get(sym, sym)
-        trader = self.dashboard.traders.get(name)
-        direction = "CALL" if side == "buy" else "PUT"
-        sig = f"Zona {zone.direction} {zone.levels}x ~{zone.avg_ratio}x {zone.price_min}-{zone.price_max}"
-        trade = trader.add_trade(direction, 0.0, signal_info=sig) if trader else None
-        st["trade_id"] = trade.id if trade else None
+    async def _checagem_diaria(self):
+        """1x/dia: decide entradas com base no candle diario FECHADO mais recente (UTC).
+        O candle [0] da OKX e o de hoje (aberto); os fechados comecam em [1].
+        Marca o dia inteiro no FIM do loop (todos os pares processam juntos)."""
+        if time.time() - self._ultima_tentativa_diaria < 60:
+            return
+        self._ultima_tentativa_diaria = time.time()
+        dia = self._dia_utc()
+        if self.ultimo_dia_checado == dia:
+            return  # dia ja processado (todos os pares)
+        cfg = self.v4_config
+        for sym in list(self.lot_sizes.keys()):
+            if self.posicoes.get(sym):
+                continue
+            try:
+                r = await self.okx_trader._request(
+                    "GET", f"/api/v5/market/candles?instId={sym}&bar=1D&limit=40")
+                data = r.get("data") or []
+                if len(data) < cfg["lookback"] + 3:
+                    continue
+                fechados = list(reversed(data[1:]))  # asc, terminando em "ontem"
+                candles = [{"ts": int(c[0]), "o": float(c[1]), "h": float(c[2]),
+                            "l": float(c[3]), "c": float(c[4])} for c in fechados]
+                closes = [c["c"] for c in candles]
+                ret = closes[-1] / closes[-1 - cfg["lookback"]] - 1
+                atrs = self._atr14(candles)
+                atr = atrs[-1]
+                nome = self.sym_trader.get(sym, sym)
+                if ret >= cfg["thr"] and atr > 0:
+                    await self._abrir_posicao(sym, nome, closes[-1], atr)
+                self.dashboard.log(
+                    f"Diario {nome}: ret30d {ret*100:+.1f}% | "
+                    f"{'SINAL ENTRADA' if ret >= cfg['thr'] else 'sem sinal'} | "
+                    f"atr14 {atr:.4f}")
+            except Exception as e:
+                self.dashboard.log(f"Erro diario {sym}: {str(e)[:60]}")
+        self.ultimo_dia_checado = dia
+
+    async def _abrir_posicao(self, sym: str, nome: str, close_ref: float, atr: float):
+        cfg = self.v4_config
+        try:
+            bal = await self.okx_trader._request("GET", "/api/v5/account/balance?ccy=USDT")
+            det = ((bal.get("data") or [{}])[0].get("details") or [{}])[0]
+            usdt = float(det.get("availBal") or 0)
+        except Exception:
+            usdt = 0.0
+        montante = usdt * cfg["fracao"]
+        if montante < 12:
+            self.dashboard.log(f"{nome}: saldo insuficiente p/ entrada (USDT {usdt:.2f})")
+            return
+        resp = await self.okx_trader.paper_place_order(sym, "buy", montante)
+        if not resp.get("ok"):
+            self.dashboard.log(f"{nome}: entrada FALHOU: {resp.get('error')}")
+            return
+        entry_px = resp["avg_px"]
+        qty = float(resp.get("fill_sz") or 0) or (montante / entry_px if entry_px else 0.0)
+        stop_px = round(entry_px - cfg["k_atr"] * atr, 8)
+        target_px = round(entry_px + cfg["k_atr"] * atr * cfg["rr"], 8)
+        pos = {"sym": sym, "qty": qty, "entry_px": entry_px, "stop_px": stop_px,
+               "target_px": target_px, "aberta_ts": time.time(),
+               "fee_open": resp.get("fee") or 0.0, "trade_id": None}
+        trader = self.dashboard.traders.get(nome)
+        if trader:
+            tr = trader.add_trade("CALL", 0.0,
+                signal_info=f"MOM30D ret>=5% | stop {stop_px:.2f} | alvo {target_px:.2f}")
+            pos["trade_id"] = tr.id
+        self.posicoes[sym] = pos
+        self._salvar_posicoes()
         self.dashboard.log(
-            f"ENTRADA {name} {direction} {st['qty']} @ {avg_px:.2f} | stop {st['stop_px']:.2f} | alvo {st['target_px']:.2f}")
+            f"ENTRADA {nome} LONG {qty} @ {entry_px:.2f} | stop {stop_px:.2f} "
+            f"| alvo {target_px:.2f} | risco ~{cfg['k_atr']*atr/entry_px*100:.2f}%")
 
-    async def _check_position(self, sym: str, st: dict, now: float):
-        px = self.engine.last_price.get(sym)
+    async def _monitor_posicao(self, sym: str, pos: dict):
+        px = self._preco_atual(sym)
         if not px:
             return
-        cfg = self.v2_config
-        if now - st["opened_at"] > cfg["pos_timeout"]:
-            await self._close_position(sym, st, "timeout")
-            return
-        side = st["side"]
-        if side == "buy":
-            if px <= st["stop_px"]:
-                await self._close_position(sym, st, "stop")
-            elif px >= st["target_px"]:
-                await self._close_position(sym, st, "alvo")
-        else:
-            if px >= st["stop_px"]:
-                await self._close_position(sym, st, "stop")
-            elif px <= st["target_px"]:
-                await self._close_position(sym, st, "alvo")
+        cfg = self.v4_config
+        dias = (time.time() - pos["aberta_ts"]) / 86400.0
+        motivo = None
+        if px <= pos["stop_px"]:
+            motivo = "stop"
+        elif px >= pos["target_px"]:
+            motivo = "alvo"
+        elif dias >= cfg["timeout_dias"]:
+            motivo = "timeout"
+        if motivo:
+            await self._fechar_posicao(sym, pos, motivo)
 
-    async def _close_position(self, sym: str, st: dict, motivo: str):
-        side = st["side"]
-        qty = st["qty"]
-        close_side = "sell" if side == "buy" else "buy"
-        if close_side == "buy":
-            resp = await self.okx_trader.paper_place_order(sym, close_side, qty, tgt_ccy="base_ccy")
-        else:
-            resp = await self.okx_trader.paper_place_order(sym, close_side, qty)
+    async def _fechar_posicao(self, sym: str, pos: dict, motivo: str):
+        resp = await self.okx_trader.paper_place_order(sym, "sell", pos["qty"])
         if not resp.get("ok"):
             self.dashboard.log(f"{sym}: fechamento ({motivo}) falhou: {resp.get('error')} - nova tentativa em 3s")
             await asyncio.sleep(3)
-            if close_side == "buy":
-                resp = await self.okx_trader.paper_place_order(sym, close_side, qty, tgt_ccy="base_ccy")
-            else:
-                resp = await self.okx_trader.paper_place_order(sym, close_side, qty)
+            resp = await self.okx_trader.paper_place_order(sym, "sell", pos["qty"])
         if not resp.get("ok"):
             self.dashboard.log(f"{sym}: posicao NAO fechada ({motivo}) - requer atencao")
             return
         exit_px = resp["avg_px"]
-        fees = abs(st.get("fee_open") or 0) + abs(resp.get("fee") or 0)
-        if side == "buy":
-            result = round((exit_px - st["entry_px"]) * qty - fees, 2)
-        else:
-            result = round((st["entry_px"] - exit_px) * qty - fees, 2)
-        name = self.sym_trader.get(sym, sym)
-        trader = self.dashboard.traders.get(name)
-        if trader and st.get("trade_id"):
-            resolved = trader.resolve_trade(st["trade_id"], result)
+        qty = pos["qty"]
+        fees = abs(pos.get("fee_open") or 0) + abs(resp.get("fee") or 0)
+        result = round((exit_px - pos["entry_px"]) * qty - fees, 2)
+        nome = self.sym_trader.get(sym, sym)
+        trader = self.dashboard.traders.get(nome)
+        if trader and pos.get("trade_id"):
+            try:
+                trader.resolve_trade(pos["trade_id"], result)
+            except Exception:
+                pass
         try:
             self.okx_trader.account.balance = round((self.okx_trader.account.balance or 0) + result, 2)
             self.okx_trader.account.available = max(0.0, round((self.okx_trader.account.available or 0) + result, 2))
         except Exception:
             pass
+        self.posicoes[sym] = None
+        self._salvar_posicoes()
         self.dashboard.log(
-            f"FECHADO {name} [{motivo.upper()}] {'WIN' if result > 0 else 'LOSS'} ${result:+.2f} "
-            f"({st['entry_px']:.2f}->{exit_px:.2f})")
-        st["state"] = "IDLE"
-        st["ord_id"] = None
-        st["cooldown_until"] = time.time() + self.v2_config["cooldown"]
+            f"FECHADO {nome} [{motivo.upper()}] {'WIN' if result > 0 else 'LOSS'} ${result:+.2f} "
+            f"({pos['entry_px']:.2f}->{exit_px:.2f})")
 
-    async def _on_candle_close(self, candle):
-        """Candle de 1min fechado: detecta zonas e tenta entrada no retest."""
+    def _salvar_posicoes(self):
+        """Persiste o estado das posicoes (sobrevive a restarts do processo)."""
         try:
-            from orderflow_engine import detect_stacked_zones
-        except ImportError:
-            return
-        cfg = self.v2_config
-        sym = candle.symbol
-        st = self.zone_state.get(sym)
-        if not st:
-            return
-        self.dashboard.log(
-            f"Candle {sym}: {candle.trades} trades | delta {candle.delta():+.4f} | buy {candle.buy_vol:.4f} sell {candle.sell_vol:.4f}")
-        zones = detect_stacked_zones(candle, threshold=cfg["threshold"],
-                                     min_levels=cfg["min_levels"],
-                                     min_denom_frac=cfg["min_denom_frac"])
-        for z in zones:
-            self.dashboard.log(
-                f"ZONA {sym} {z.direction.upper()} {z.levels}lv ~{z.avg_ratio}x "
-                f"{z.price_min:.2f}-{z.price_max:.2f} | delta {candle.delta():+.4f}")
-        if not zones or st["state"] != "IDLE":
-            return
-        if self.paused:
-            return  # pausado: zonas continuam sendo logadas, mas nao viram entrada
-        if time.time() < st.get("cooldown_until", 0):
-            return
-        zones.sort(key=lambda z: (z.levels, z.avg_ratio), reverse=True)
-        zone = zones[0]
-        px = self.engine.last_price.get(sym)
-        if not px:
-            return
-        # filtro de tendencia: continuacao exige alinhamento com EMA(curto prazo)
-        ema = self.engine.ema(sym, cfg["ema_period"])
-        if ema is None:
-            self.dashboard.log(f"{sym}: aguardando EMA ({len(self.engine.close_history.get(sym) or [])}/{cfg['ema_period']} candles)")
-            return
-        if zone.direction == "buy" and px < ema:
-            self.dashboard.log(f"{sym}: zona BUY sem alinhamento (px {px:.2f} < EMA {ema:.2f}) - descartada")
-            return
-        if zone.direction == "sell" and px > ema:
-            self.dashboard.log(f"{sym}: zona SELL sem alinhamento (px {px:.2f} > EMA {ema:.2f}) - descartada")
-            return
-        await self._try_open_retest(sym, st, zone, px)
+            import json as _json
+            os.makedirs(os.path.dirname(self._arquivo_posicoes), exist_ok=True)
+            with open(self._arquivo_posicoes, "w") as f:
+                _json.dump({s: (p if p else None) for s, p in (self.posicoes or {}).items()}, f)
+        except Exception as e:
+            self.dashboard.log(f"Nao salvou estado de posicoes: {e}")
 
-    async def _try_open_retest(self, sym: str, st: dict, zone, px: float):
-        name = self.sym_trader.get(sym, sym)
-        trader = self.dashboard.traders.get(name)
-        if not trader:
-            return
-        cfg = self.v2_config
-        side = "buy" if zone.direction == "buy" else "sell"
-        if side == "buy":
-            limit_px = zone.price_min
-            if px <= limit_px:
-                self.dashboard.log(f"{sym}: zona BUY ja quebrada (px {px:.2f} <= {limit_px:.2f})")
-                return
-        else:
-            limit_px = zone.price_max
-            if px >= limit_px:
-                self.dashboard.log(f"{sym}: zona SELL ja quebrada (px {px:.2f} >= {limit_px:.2f})")
-                return
-        info = self.lot_sizes.get(sym) or {}
+    def _carregar_posicoes(self):
+        """Restaura posicoes persistidas apos restart (mantem stop/alvo ativos)."""
         try:
-            tick_sz = float(info.get("tickSz") or 0.1)
-        except (TypeError, ValueError):
-            tick_sz = 0.1
-        limit_px = round(limit_px / tick_sz) * tick_sz
-        qty = self._round_spot_qty(sym, trader.bet_size / limit_px)
-        if qty <= 0:
-            return
-        # PUT (sell) em spot exige ter o ativo
-        if side == "sell":
-            base_ccy = sym.split("-")[0]
+            import json as _json
+            if os.path.exists(self._arquivo_posicoes):
+                with open(self._arquivo_posicoes) as f:
+                    dados = _json.load(f)
+                for s, p in (dados or {}).items():
+                    if p and s in self.posicoes and p.get("entry_px"):
+                        self.posicoes[s] = p
+                self.dashboard.log("Posicoes restauradas do arquivo de estado")
+        except Exception as e:
+            self.dashboard.log(f"Nao restaurou posicoes: {e}")
+
+    async def _alertar_orfas(self):
+        """Se a conta tem ativo base sem estado no bot (restart sem arquivo), alerta."""
+        for sym in list(self.lot_sizes.keys()):
+            if self.posicoes.get(sym):
+                continue
+            base = sym.split("-")[0]
             try:
-                b = await self.okx_trader._request("GET", f"/api/v5/account/balance?ccy={base_ccy}")
+                b = await self.okx_trader._request("GET", f"/api/v5/account/balance?ccy={base}")
                 det = ((b.get("data") or [{}])[0].get("details") or [{}])[0]
                 have = float(det.get("availBal") or 0)
+                if have > 0:
+                    self.dashboard.log(
+                        f"ALERTA: {have:.6f} {base} na conta sem posicao registrada - "
+                        f"pode ser posicao orfa de restart (gere manualmente)")
             except Exception:
-                have = 0.0
-            if have < qty:
-                self.dashboard.log(f"{sym}: sem {base_ccy} p/ PUT ({have:.6f} < {qty:.6f})")
-                return
-        resp = await self.okx_trader.paper_place_limit(sym, side, qty, limit_px)
-        if not resp.get("ok"):
-            self.dashboard.log(f"{sym}: ordem limit rejeitada: {resp.get('error')}")
-            return
-        st.update({"state": "RETEST", "ord_id": resp["ord_id"], "zone": zone,
-                   "side": side, "qty": qty, "t0": time.time()})
-        self.dashboard.log(
-            f"{name}: retest {side} {qty} @ limit {limit_px:.2f} (zona {zone.price_min:.2f}-{zone.price_max:.2f})")
-
-    def _round_spot_qty(self, symbol: str, qty: float) -> float:
-        """Arredonda para baixo ao multiplo do lote minimo do par spot."""
-        import math
-        info = self.lot_sizes.get(symbol) or {}
-        try:
-            lot = float(info.get("lotSz") or 1e-8)
-        except (TypeError, ValueError):
-            lot = 1e-8
-        if lot <= 0:
-            lot = 1e-8
-        return round(math.floor(qty / lot) * lot, 12)
+                pass
     def run(self):
         """Synchronous entry point - creates and runs event loop"""
         # Create and run event loop
@@ -1069,7 +1057,7 @@ class OKXPaperTerminal:
         # Add traders
         self.add_trader("Alpha", "BTCUSDT", 12.50, 60)
         self.add_trader("Beta", "ETHUSDT", 10.00, 60)
-        self.add_trader("Gamma", "BNBUSDT", 8.00, 60)
+        self.add_trader("Gamma", "DOGEUSDT", 8.00, 60)
         self.add_trader("Delta", "SOLUSDT", 12.00, 60)
         
         print(f"Conectando OKX API (Demo)...")
@@ -1081,35 +1069,24 @@ class OKXPaperTerminal:
         print(f"OKX Paper Trading conectado - {len(self.dashboard.traders)} traders")
         print("Dashboard rodando... Ctrl+C para sair\n")
 
-        # ===== V2: inicia o feed de footprint (trades com lado agressor) =====
+        # ===== V4: estado das posicoes + feed visual (footprint so p/ dashboard) =====
         try:
             from orderflow_engine import FootprintFeed
             symbols = [t.okx_symbol for t in self.dashboard.traders.values()]
             self.sym_trader = {t.okx_symbol: name for name, t in self.dashboard.traders.items()}
-            for s in symbols:
-                self.zone_state[s] = {
-                    "state": "IDLE", "ord_id": None, "zone": None, "t0": 0,
-                    "cooldown_until": 0, "entry_px": 0.0, "qty": 0.0,
-                    "side": None, "stop_px": 0.0, "target_px": 0.0,
-                    "trade_id": None, "opened_at": 0,
-                }
-            self.engine = FootprintFeed(symbols, candle_seconds=self.v2_config["candle_seconds"],
-                                        on_candle_close=self._on_candle_close)
+            self.posicoes = {s: None for s in symbols}
+            # feed de trades roda SO para visualizacao (delta no dashboard);
+            # a execucao V4 e diaria (momentum multi-diario), nao usa footprint
+            self.engine = FootprintFeed(symbols, candle_seconds=300, on_candle_close=None)
             self.engine_task = asyncio.create_task(self.engine.run())
-            # pre-carrega closes historicos p/ a EMA iniciar pronta (sem warm-up a cada restart)
-            try:
-                for sym in symbols:
-                    r = await self.okx_trader._request(
-                        "GET", f"/api/v5/market/history-candles?instId={sym}&bar=5m&limit=60")
-                    hist = r.get("data") or []
-                    for c in reversed(hist):  # mais antigo -> mais recente
-                        self.engine.close_history.setdefault(sym, []).append(float(c[4]))
-                    self.dashboard.log(f"Historico {sym}: {len(hist)} closes 5m carregados p/ EMA")
-            except Exception as e:
-                self.dashboard.log(f"Historico p/ EMA falhou: {e}")
-            self.dashboard.log(f"Engine V2 (footprint real) iniciado - candle {self.v2_config['candle_seconds']}s")
+            self.dashboard.log("Engine V4 (momentum diario) iniciado - feed visual ativo")
+            self._carregar_posicoes()
+            await self._alertar_orfas()
         except Exception as e:
-            self.dashboard.log(f"Engine V2 falhou ao iniciar: {e}")
+            self.dashboard.log(f"Engine visual falhou: {e}")
+            self.posicoes = {t.okx_symbol: None for t in self.dashboard.traders.values()}
+            self.engine = None
+            self.engine_task = None
 
         # Web dashboard acessivel pelo navegador (porta $PORT na Railway)
         try:
@@ -1219,7 +1196,7 @@ async function refresh(){
     document.getElementById('traders').innerHTML=`<thead><tr><th>#</th><th>TRADER</th><th>PAR</th><th>BET</th><th>EXP</th><th>ST</th><th>WINS</th><th>LOSSES</th><th>WR%</th><th>P&L</th><th>STREAK</th></tr></thead><tbody>`+s.traders.map((t,i)=>`<tr><td>${i+1}</td><td>${t.name}</td><td>${t.pair}</td><td>$${fmt(t.bet_size)}</td><td>${t.expiration}s</td><td><span class="pill ${t.enabled?'on':'off'}">${t.enabled?'ON':'OFF'}</span></td><td class="pos">${t.wins}</td><td class="neg">${t.losses}</td><td class="${t.win_rate>=60?'pos':(t.win_rate>=50?'neu':'neg')}">${t.win_rate}%</td><td>${pnl(t.total_pnl)}</td><td class="${cls(t.current_streak)}">${t.current_streak?((t.current_streak>0?'+':'')+t.current_streak+' '+t.streak_type):'--'}</td></tr>`).join('')+`</tbody>`;
     document.getElementById('ops').innerHTML=`<thead><tr><th>HORA</th><th>TRADER</th><th>PAR</th><th>DIR</th><th>BET</th><th>PROB</th><th>RESULTADO</th><th>ST</th><th>P&L ACC</th></tr></thead><tbody>`+(s.operations.length?s.operations.slice().reverse().map(o=>`<tr><td>${o.timestamp}</td><td>${o.trader}</td><td>${o.pair}</td><td class="${o.direction==='CALL'?'pos':'neg'}">${o.direction==='CALL'?'▲ CALL':'▼ PUT'}</td><td>$${fmt(o.bet)}</td><td>${fmt(o.probability)}</td><td>${o.result==null?'--':pnl(o.result)}</td><td><span class="pill ${o.status==='WIN'?'win':(o.status==='LOSS'?'loss':'w8')}">${o.status==='Aguardando'?'AGUARDANDO':o.status}</span></td><td>${pnl(o.cumulative_pnl)}</td></tr>`).join(''):`<tr><td colspan="9" style="color:#64748b">Aguardando operacoes...</td></tr>`)+`</tbody>`;
     const pos=(s.positions||[]);
-    document.getElementById('pos').innerHTML=`<thead><tr><th>TRADER</th><th>SIMBOLO</th><th>LADO</th><th>TAMANHO</th><th>ENTRADA</th><th>STOP</th><th>ALVO</th><th>STATUS</th></tr></thead><tbody>`+(pos.length?pos.map(p=>`<tr><td>${p.trader}</td><td>${p.symbol}</td><td class="${p.side==='buy'?'pos':'neg'}">${p.side==='buy'?'▲ COMPRA':'▼ VENDA'}</td><td>${p.size}</td><td>${p.entry_price==null?'--':'$'+fmt(p.entry_price)}</td><td>${p.stop_px==null?'--':'$'+fmt(p.stop_px)}</td><td>${p.target_px==null?'--':'$'+fmt(p.target_px)}</td><td><span class="pill ${p.status==='ABERTA'?'win':'w8'}">${p.status}</span></td></tr>`).join(''):`<tr><td colspan="8" style="color:#64748b">Nenhuma operacao (aguardando zona de footprint)</td></tr>`)+`</tbody>`;
+    document.getElementById('pos').innerHTML=`<thead><tr><th>TRADER</th><th>SIMBOLO</th><th>LADO</th><th>TAMANHO</th><th>ENTRADA</th><th>STOP</th><th>ALVO</th><th>STATUS</th></tr></thead><tbody>`+(pos.length?pos.map(p=>`<tr><td>${p.trader}</td><td>${p.symbol}</td><td class="${p.side==='buy'?'pos':'neg'}">${p.side==='buy'?'▲ COMPRA':'▼ VENDA'}</td><td>${p.size}</td><td>${p.entry_price==null?'--':'$'+fmt(p.entry_price)}</td><td>${p.stop_px==null?'--':'$'+fmt(p.stop_px)}</td><td>${p.target_px==null?'--':'$'+fmt(p.target_px)}</td><td><span class="pill ${p.status&&p.status.startsWith('ABERTA')?'win':'w8'}">${p.status}</span></td></tr>`).join(''):`<tr><td colspan="8" style="color:#64748b">Nenhuma posicao (momentum diario - checagem 1x/dia apos close UTC)</td></tr>`)+`</tbody>`;
     document.getElementById('logs').innerHTML=(s.logs||[]).map(l=>`<div>${l.replace(/Analisando|SINAL|RESOLVIDO|Erro/g,'<b>$&</b>')}</div>`).join('')||'<div>sem logs</div>';
   }catch(e){
     document.getElementById('live').className='off';
@@ -1285,29 +1262,20 @@ setInterval(refresh,3000);refresh();
                         state["market"][sym]["delta"] = round(d * last, 2) if last else None
             except Exception:
                 pass
-        # Operacoes V2: retests aguardando e posicoes abertas (stop/alvo)
+        # Posicoes V4 (momentum multi-diario)
         state["positions"] = []
-        for sym, st in (term.zone_state or {}).items():
-            stt = st.get("state")
-            if stt in ("RETEST", "IN_POS"):
+        for sym, p in (term.posicoes or {}).items():
+            if p:
                 trader_nm = term.sym_trader.get(sym, sym)
-                if stt == "RETEST":
-                    state["positions"].append({
-                        "trader": trader_nm, "symbol": sym,
-                        "side": st.get("side"), "size": st.get("qty"),
-                        "entry_price": None, "opened_at": "retest",
-                        "stop_px": None, "target_px": None,
-                        "status": "RETEST",
-                    })
-                else:
-                    state["positions"].append({
-                        "trader": trader_nm, "symbol": sym,
-                        "side": st.get("side"), "size": st.get("qty"),
-                        "entry_price": st.get("entry_px"),
-                        "opened_at": datetime.fromtimestamp(st.get("opened_at") or 0).strftime("%H:%M:%S"),
-                        "stop_px": st.get("stop_px"), "target_px": st.get("target_px"),
-                        "status": "ABERTA",
-                    })
+                dias = max(0, int((time.time() - p["aberta_ts"]) / 86400.0))
+                state["positions"].append({
+                    "trader": trader_nm, "symbol": sym,
+                    "side": "buy", "size": p.get("qty"),
+                    "entry_price": p.get("entry_px"),
+                    "opened_at": f"{dias}d",
+                    "stop_px": p.get("stop_px"), "target_px": p.get("target_px"),
+                    "status": f"ABERTA {dias}d",
+                })
         ops = []
         for name, tr in dash.traders.items():
             for td in tr.trades:
