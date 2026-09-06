@@ -17,6 +17,7 @@ import hmac
 import hashlib
 import base64
 import json
+import sqlite3
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pandas as pd
@@ -212,35 +213,74 @@ class OKXPaperTrader:
         if resp.get("code") != "0":
             return {"ok": False, "error": resp.get("msg") or resp.get("code") or "erro desconhecido"}
         ord_id = resp["data"][0]["ordId"]
-        # Aguarda o preenchimento e busca o fill real (preco + fee + quantidade da OKX)
-        for _ in range(12):
+        # Aguarda o estado terminal da ordem e usa os agregados REAIS da OKX
+        # (avgPx/fee/accFillSz cobrem todas as fatias do fill - o primeiro fill
+        # isolado e parcial e engana o registro de qty/preco).
+        st = None
+        for _ in range(14):  # ate ~7s
             await asyncio.sleep(0.5)
-            fill = await self._get_fill(symbol, ord_id)
-            if fill:
+            st = await self.get_order_state(symbol, ord_id)
+            if not st:
+                continue
+            if st["state"] == "filled":
+                avg_px = st.get("avg_px") or 0.0
+                fee = st.get("fee") or 0.0
+                fill_sz = st.get("filled_sz") or 0.0
+                if avg_px <= 0 or fill_sz <= 0:
+                    fill = await self._get_fill(symbol, ord_id)
+                    if fill:
+                        avg_px = fill["avg_px"]
+                        fee = fill["fee"]
+                        fill_sz = fill.get("fill_sz") or 0.0
                 return {
                     "ok": True, "ord_id": ord_id, "side": side, "size": size,
-                    "avg_px": fill["avg_px"], "fee": fill["fee"],
-                    "fill_sz": fill.get("fill_sz") or 0.0,
-                    "fill_ccy": fill.get("fill_ccy") or ""
+                    "avg_px": avg_px, "fee": fee,
+                    "fill_sz": fill_sz,
+                    "fill_ccy": ""
                 }
-        return {"ok": False, "error": "ordem enviada mas fill nao confirmado", "ord_id": ord_id}
+            if st["state"] == "canceled":
+                return {"ok": False, "error": "ordem cancelada pela OKX (protecao de preco?)",
+                        "ord_id": ord_id, "state": "canceled",
+                        "fill_sz": st.get("filled_sz") or 0.0,
+                        "fee": st.get("fee") or 0.0}
+        estado = st.get("state") if st else "unknown"
+        return {"ok": False, "error": f"ordem sem estado terminal em ~7s ({estado})",
+                "ord_id": ord_id, "state": estado,
+                "fill_sz": (st.get("filled_sz") or 0.0) if st else 0.0}
 
     async def _get_fill(self, symbol: str, ord_id: str) -> Optional[Dict]:
+        """Agrega TODAS as fatias de fill da ordem (VWAP de preco, soma de fee/qty).
+
+        Usar apenas o primeiro fill (data[0]) reporta qty parcial e preco da 1a
+        fatia - engana o registro de posicao e o P&L (fills multi-fatia sao
+        comuns mesmo em ordens pequenas no livro fino da demo)."""
         resp = await self._request("GET", f"/api/v5/trade/fills?instId={symbol}&ordId={ord_id}")
         data = resp.get("data") or []
         if not data:
             return None
-        f = data[0]
-        try:
-            avg_px = float(f.get("fillPx") or f.get("avgPx") or 0)
-            fee = float(f.get("fee") or 0)
-            fill_sz = float(f.get("fillSz") or 0)
-        except (TypeError, ValueError):
+        tot_sz = 0.0
+        tot_px = 0.0
+        fee = 0.0
+        fill_ccy = ""
+        for f in data:
+            try:
+                px = float(f.get("fillPx") or 0)
+                sz = float(f.get("fillSz") or 0)
+            except (TypeError, ValueError):
+                continue
+            if px > 0 and sz > 0:
+                tot_sz += sz
+                tot_px += px * sz
+            try:
+                fee += float(f.get("fee") or 0)
+            except (TypeError, ValueError):
+                pass
+            if not fill_ccy:
+                fill_ccy = f.get("fillCcy") or ""
+        if tot_sz <= 0 or tot_px <= 0:
             return None
-        if avg_px <= 0:
-            return None
-        return {"avg_px": avg_px, "fee": fee, "fill_sz": fill_sz,
-                "fill_ccy": f.get("fillCcy") or ""}
+        return {"avg_px": tot_px / tot_sz, "fee": fee, "fill_sz": tot_sz,
+                "fill_ccy": fill_ccy}
 
     async def paper_place_limit(self, symbol: str, side: str, size: float,
                                 limit_px: float, signal_info: str = "") -> Dict:
@@ -274,6 +314,89 @@ class OKXPaperTrader:
         resp = await self._request("POST", "/api/v5/trade/cancel",
                                    body={"instId": symbol, "ordId": ord_id})
         return resp.get("code") == "0"
+
+    async def _tick_size(self, symbol: str) -> float:
+        """tickSz do instrumento (cache) p/ arredondar preco de ordem limit."""
+        if not hasattr(self, "_tick_cache"):
+            self._tick_cache: Dict[str, float] = {}
+        if symbol in self._tick_cache:
+            return self._tick_cache[symbol]
+        try:
+            r = await self._request(
+                "GET", f"/api/v5/public/instruments?instType=SPOT&instId={symbol}")
+            spec = (r.get("data") or [{}])[0]
+            ts = float(spec.get("tickSz") or 0.01)
+        except Exception:
+            ts = 0.01
+        self._tick_cache[symbol] = ts
+        return ts
+
+    @staticmethod
+    def _round_step(value: float, step: float) -> float:
+        """Arredonda value para a resolucao do step (tickSz/lotSz)."""
+        if step <= 0:
+            return value
+        s = f"{step:.10f}".rstrip("0")
+        casas = len(s.split(".")[1]) if "." in s else 0
+        return round(value, casas)
+
+    async def close_position_robust(self, symbol: str, qty: float) -> Dict:
+        """Fecha posicao long vendendo qty (ativo base) de forma robusta.
+
+        Tenta market sell primeiro; se a OKX cancelar (protecao de preco -
+        sintoma do erro 51138 / ordens canceladas vistas em ETH), faz fallback:
+        LIMIT sell no bid atual, que preenche no topo do livro sem passar pela
+        protecao. Se o limit ficar vivo ~10s, cancela e devolve erro (o chamador
+        re-tenta com backoff de 60s). Fill parcial devolve fill_sz>0 c/ ok=False
+        p/ o chamador reduzir a qty registrada. Formato igual ao paper_place_order.
+        """
+        resp = await self.paper_place_order(symbol, "sell", qty)
+        if resp.get("ok"):
+            return resp
+
+        try:
+            tk = await self.get_ticker(symbol)
+            d = (tk.get("data") or [{}])[0]
+            bid = float(d.get("bidPx") or 0)
+            if bid <= 0:
+                return resp  # sem referencia de preco: mantem erro original
+            tick = await self._tick_size(symbol)
+            px = self._round_step(bid, tick)
+            lr = await self.paper_place_limit(symbol, "sell", qty, px)
+            if not lr.get("ok"):
+                return resp  # limit tb falhou: mantem erro p/ backoff do chamador
+            st = None
+            for _ in range(20):  # ate ~10s p/ fill
+                await asyncio.sleep(0.5)
+                st = await self.get_order_state(symbol, lr["ord_id"])
+                if st and st["state"] in ("filled", "canceled"):
+                    break
+            if st and st["state"] == "filled":
+                filled = st.get("filled_sz") or qty
+                if filled < qty * 0.9999:
+                    return {"ok": False, "error": "fallback limit: fill parcial",
+                            "ord_id": lr["ord_id"], "fill_sz": filled, "partial": True,
+                            "fee": st.get("fee") or 0.0}
+                return {"ok": True, "ord_id": lr["ord_id"], "side": "sell",
+                        "size": qty, "avg_px": st.get("avg_px") or bid,
+                        "fee": st.get("fee") or 0.0, "fill_sz": filled,
+                        "fill_ccy": "", "via": "limit_fallback"}
+            if st and st["state"] in ("canceled", "live"):
+                filled = st.get("filled_sz") or 0.0
+                if st["state"] == "live":
+                    await self.cancel_order(symbol, lr["ord_id"])
+                if filled > 1e-9:
+                    return {"ok": False, "error": "fallback limit: fill parcial",
+                            "ord_id": lr["ord_id"], "fill_sz": filled, "partial": True,
+                            "fee": st.get("fee") or 0.0}
+                return {"ok": False,
+                        "error": f"fallback limit {st['state']} (sem fill) - cancelada",
+                        "ord_id": lr["ord_id"], "state": "canceled"}
+            return {"ok": False, "error": "fallback limit: estado desconhecido",
+                    "ord_id": lr.get("ord_id")}
+        except Exception as e:
+            return {"ok": False, "error": f"fallback limit falhou: {str(e)[:80]}",
+                    "ord_id": resp.get("ord_id")}
     
     def update_mark_prices(self):
         for key, pos in self.positions.items():
@@ -773,6 +896,10 @@ class OKXPaperTerminal:
         self._ultima_tentativa_diaria: float = 0.0
         self._arquivo_posicoes = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "data", "posicoes_v4.json")
+        # ===== Persistencia de operacoes resolvidas (P&L sobrevive a restart) =====
+        self._db_ops = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "data", "operacoes_v4.db")
+        self._db_init()
     
     async def initialize(self):
         self.okx_trader = OKXPaperTrader(
@@ -969,15 +1096,25 @@ class OKXPaperTerminal:
                 await self._fechar_posicao(sym, pos, motivo)
 
     async def _fechar_posicao(self, sym: str, pos: dict, motivo: str):
-        resp = await self.okx_trader.paper_place_order(sym, "sell", pos["qty"])
+        resp = await self.okx_trader.close_position_robust(sym, pos["qty"])
         if not resp.get("ok"):
             pos["ultima_tentativa"] = time.time()
+            vendido = float(resp.get("fill_sz") or 0)
+            if vendido > 1e-9:
+                # fechamento parcial: reduz a qty registrada e re-tenta o resto em 60s
+                pos["qty"] = round(pos["qty"] - vendido, 10)
+                pos["fee_open"] = abs(pos.get("fee_open") or 0) + abs(resp.get("fee") or 0)
+                self._salvar_posicoes()
+                self.dashboard.log(
+                    f"{self.sym_trader.get(sym, sym)}: fechamento ({motivo}) PARCIAL "
+                    f"({vendido:.6f} vendido) - resta {pos['qty']:.6f}, retry em 60s")
+                return
             self.dashboard.log(
                 f"{self.sym_trader.get(sym, sym)}: fechamento ({motivo}) falhou: "
                 f"{resp.get('error')} - nova tentativa em 60s")
             return
         exit_px = resp["avg_px"]
-        qty = pos["qty"]
+        qty = float(resp.get("fill_sz") or pos["qty"])
         fees = abs(pos.get("fee_open") or 0) + abs(resp.get("fee") or 0)
         result = round((exit_px - pos["entry_px"]) * qty - fees, 2)
         nome = self.sym_trader.get(sym, sym)
@@ -997,6 +1134,93 @@ class OKXPaperTerminal:
         self.dashboard.log(
             f"FECHADO {nome} [{motivo.upper()}] {'WIN' if result > 0 else 'LOSS'} ${result:+.2f} "
             f"({pos['entry_px']:.2f}->{exit_px:.2f})")
+        try:
+            self._db_salvar_op(nome, sym, "CALL", motivo, result,
+                               pos["entry_px"], exit_px, fees)
+        except Exception:
+            pass
+
+    # ===== Persistencia SQLite de operacoes resolvidas (P&L nao zera no restart) =====
+    def _db_init(self):
+        """Cria o schema se necessario. Falha silenciosa: persistencia nunca derruba o bot."""
+        try:
+            os.makedirs(os.path.dirname(self._db_ops), exist_ok=True)
+            con = sqlite3.connect(self._db_ops)
+            con.execute("""CREATE TABLE IF NOT EXISTS operacoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER, trader TEXT, symbol TEXT, direction TEXT,
+                motivo TEXT, result REAL, entry_px REAL, exit_px REAL,
+                fees REAL, status TEXT)""")
+            con.commit()
+            con.close()
+        except Exception as e:
+            try:
+                self.dashboard.log(f"DB ops indisponivel: {str(e)[:60]}")
+            except Exception:
+                pass
+
+    def _db_salvar_op(self, trader: str, symbol: str, direction: str, motivo: str,
+                      result: float, entry_px: float, exit_px: float, fees: float):
+        try:
+            con = sqlite3.connect(self._db_ops)
+            con.execute(
+                "INSERT INTO operacoes (ts, trader, symbol, direction, motivo, "
+                "result, entry_px, exit_px, fees, status) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (int(time.time()), trader, symbol, direction, motivo,
+                 round(result, 2), entry_px, exit_px, round(fees, 8),
+                 "WIN" if result > 0 else "LOSS"))
+            con.commit()
+            con.close()
+        except Exception:
+            pass
+
+    def _db_carregar_ops(self, limite: int = 200) -> List[dict]:
+        """Operacoes resolvidas em ordem cronologica (mais antiga primeiro)."""
+        try:
+            con = sqlite3.connect(self._db_ops)
+            con.row_factory = sqlite3.Row
+            rows = con.execute(
+                "SELECT * FROM operacoes ORDER BY id DESC LIMIT ?",
+                (limite,)).fetchall()
+            con.close()
+            return [dict(r) for r in reversed(rows)]
+        except Exception:
+            return []
+
+    def _restaurar_historico(self):
+        """Reinjecta operacoes resolvidas do SQLite nos traders (stats + planilha).
+
+        Deve rodar DEPOIS de criar os traders (add_trader) e ANTES do loop."""
+        for op in self._db_carregar_ops(200):
+            tr = self.dashboard.traders.get(op["trader"])
+            if not tr:
+                continue
+            result = float(op["result"] or 0)
+            trade = Trade(
+                id=tr.next_id,
+                timestamp=datetime.fromtimestamp(
+                    int(op["ts"]), timezone.utc).strftime("%m/%d %H:%M:%S"),
+                pair=tr.pair,
+                direction=op.get("direction") or "CALL",
+                bet=tr.bet_size,
+                expiration=tr.expiration,
+                account="OKX-PAPER",
+                probability=0.0,
+                result=round(result, 2),
+                status=op.get("status") or ("WIN" if result > 0 else "LOSS"),
+                cumulative_pnl=0.0,
+            )
+            tr.next_id += 1
+            tr.total_pnl += result
+            tr.cumulative_pnl += result
+            trade.cumulative_pnl = tr.cumulative_pnl
+            if result > 0:
+                tr.wins += 1
+                tr.best_trade = max(tr.best_trade, result)
+            else:
+                tr.losses += 1
+                tr.worst_trade = min(tr.worst_trade, result)
+            tr.trades.append(trade)
 
     def _salvar_posicoes(self):
         """Persiste o estado das posicoes (sobrevive a restarts do processo)."""
@@ -1086,6 +1310,8 @@ class OKXPaperTerminal:
         self.add_trader("Beta", "ETHUSDT", 10.00, 60)
         self.add_trader("Gamma", "DOGEUSDT", 8.00, 60)
         self.add_trader("Delta", "SOLUSDT", 12.00, 60)
+        # Restaura o historico de operacoes resolvidas (P&L sobrevive a restart)
+        self._restaurar_historico()
         
         print(f"Conectando OKX API (Demo)...")
         
@@ -1392,10 +1618,17 @@ def main():
     print("Estratégia: Momentum demo (substitua por Stacked Imbalance real)")
     print()
 
-    # Credenciais via variáveis de ambiente (fallback = conta demo local)
-    api_key = os.environ.get("OKX_API_KEY", "68a958fc-bf85-4e91-be43-848e10b337f6")
-    secret_key = os.environ.get("OKX_API_SECRET", "35E362F2A508AEAF999750B62000F6B3")
-    passphrase = os.environ.get("OKX_PASSPHRASE", "@Extreme123")
+    # Credenciais SOMENTE via variaveis de ambiente (repo publico: nunca hardcoded)
+    missing = [k for k in ("OKX_API_KEY", "OKX_API_SECRET", "OKX_PASSPHRASE")
+               if not os.environ.get(k)]
+    if missing:
+        print("ERRO: variaveis de ambiente ausentes: " + ", ".join(missing))
+        print("Defina OKX_API_KEY, OKX_API_SECRET e OKX_PASSPHRASE antes de rodar "
+              "(Railway: configurar no servico; local: setar no .bat/terminal).")
+        return
+    api_key = os.environ["OKX_API_KEY"]
+    secret_key = os.environ["OKX_API_SECRET"]
+    passphrase = os.environ["OKX_PASSPHRASE"]
 
     bot = OKXPaperTerminal(
         api_key=api_key,
@@ -1421,7 +1654,7 @@ if __name__ == "__main__":
     print("  OKX PAPER TRADING - TERMINAL DASHBOARD  ")
     print("=" * 70)
     print()
-    print("CONFIGURE SUA PASSPHRASE OKX NO CÓDIGO ANTES DE RODAR!")
+    print("Credenciais OKX lidas de OKX_API_KEY / OKX_API_SECRET / OKX_PASSPHRASE (env).")
     print()
     
     try:
