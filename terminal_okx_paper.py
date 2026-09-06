@@ -963,16 +963,18 @@ class OKXPaperTerminal:
         elif dias >= cfg["timeout_dias"]:
             motivo = "timeout"
         if motivo:
-            await self._fechar_posicao(sym, pos, motivo)
+            # backoff de 60s entre tentativas de fechamento que falharam
+            # (protecao de preco da OKX pode bloquear venda temporariamente)
+            if time.time() - pos.get("ultima_tentativa", 0) >= 60:
+                await self._fechar_posicao(sym, pos, motivo)
 
     async def _fechar_posicao(self, sym: str, pos: dict, motivo: str):
         resp = await self.okx_trader.paper_place_order(sym, "sell", pos["qty"])
         if not resp.get("ok"):
-            self.dashboard.log(f"{sym}: fechamento ({motivo}) falhou: {resp.get('error')} - nova tentativa em 3s")
-            await asyncio.sleep(3)
-            resp = await self.okx_trader.paper_place_order(sym, "sell", pos["qty"])
-        if not resp.get("ok"):
-            self.dashboard.log(f"{sym}: posicao NAO fechada ({motivo}) - requer atencao")
+            pos["ultima_tentativa"] = time.time()
+            self.dashboard.log(
+                f"{self.sym_trader.get(sym, sym)}: fechamento ({motivo}) falhou: "
+                f"{resp.get('error')} - nova tentativa em 60s")
             return
         exit_px = resp["avg_px"]
         qty = pos["qty"]
