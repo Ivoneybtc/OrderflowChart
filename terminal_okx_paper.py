@@ -757,6 +757,8 @@ class OKXPaperTerminal:
             "stop_buffer_pct": float(os.environ.get("V2_STOP_BUFFER", "0.0004")),
             "cooldown": int(os.environ.get("V2_COOLDOWN", "90")),
         }
+        self.paused: bool = False        # pause manual: nao abre novas entradas
+        self._pause_announced: bool = False
     
     async def initialize(self):
         self.okx_trader = OKXPaperTrader(
@@ -810,6 +812,24 @@ class OKXPaperTerminal:
         if not self.engine:
             return
         now = time.time()
+        # pause: cancela retests pendentes e bloqueia novas entradas
+        # (posicoes JA abertas continuam gerenciadas: stop/alvo/timeout)
+        if self.paused:
+            for sym, st in list(self.zone_state.items()):
+                if st["state"] == "RETEST" and st.get("ord_id"):
+                    try:
+                        await self.okx_trader.cancel_order(sym, st["ord_id"])
+                    except Exception:
+                        pass
+                    st["state"] = "IDLE"
+                    st["ord_id"] = None
+                    self.dashboard.log(f"{self.sym_trader.get(sym, sym)}: retest cancelado (pause)")
+            if not self._pause_announced:
+                self._pause_announced = True
+                self.dashboard.log("BOT PAUSADO - novas entradas bloqueadas (posicoes abertas seguem gerenciadas)")
+        elif self._pause_announced:
+            self._pause_announced = False
+            self.dashboard.log("BOT ATIVO - novas entradas liberadas")
         for sym, st in list(self.zone_state.items()):
             try:
                 if st["state"] == "RETEST":
@@ -948,6 +968,8 @@ class OKXPaperTerminal:
                 f"{z.price_min:.2f}-{z.price_max:.2f} | delta {candle.delta():+.4f}")
         if not zones or st["state"] != "IDLE":
             return
+        if self.paused:
+            return  # pausado: zonas continuam sendo logadas, mas nao viram entrada
         if time.time() < st.get("cooldown_until", 0):
             return
         zones.sort(key=lambda z: (z.levels, z.avg_ratio), reverse=True)
@@ -1143,8 +1165,11 @@ tr:hover td{background:#141e31}
 .mkt .sym{color:#5eead4;font-weight:bold}
 #live{color:#34d399;font-size:11px}
 #live.off{color:#f87171}
+.btn{margin-left:14px;background:#065f46;color:#6ee7b7;border:1px solid #10b981;border-radius:8px;padding:3px 14px;font:bold 12px Consolas,Menlo,monospace;cursor:pointer;vertical-align:middle}
+.btn:hover{filter:brightness(1.25)}
+.btn.paused{background:#7f1d1d;color:#fca5a5;border-color:#ef4444}
 </style></head><body>
-<h1>OKX PAPER TRADING <span id="live">● AO VIVO</span></h1>
+<h1>OKX PAPER TRADING <span id="live">● AO VIVO</span><button id="pauseBtn" class="btn" onclick="togglePause()">⏸ PAUSAR</button></h1>
 <div class="sub" id="clock">conectando...</div>
 <div class="cards" id="cards"></div>
 <div class="mkt" id="market"></div>
@@ -1166,6 +1191,11 @@ async function refresh(){
     if(!r.ok) throw 0;
     const s=await r.json();
     document.getElementById('live').className='';
+    const live=document.getElementById('live');
+    live.textContent=s.paused?'● PAUSADO':'● AO VIVO';
+    live.style.color=s.paused?'#fbbf24':'';
+    const pb=document.getElementById('pauseBtn');
+    if(pb){pb.dataset.paused=s.paused?'1':'0';pb.textContent=s.paused?'▶ RETOMAR':'⏸ PAUSAR';pb.className='btn'+(s.paused?' paused':'');}
     document.getElementById('clock').textContent='Atualizado: '+s.local_ts+'  |  '+s.ts;
     const st=s.stats,ac=s.account||{};
     const cards=[
@@ -1196,6 +1226,19 @@ async function refresh(){
     document.getElementById('live').textContent='● SEM SINAL';
   }
 }
+async function togglePause(){
+  const pb=document.getElementById('pauseBtn');
+  const next=pb.dataset.paused!=='1';
+  pb.disabled=true;
+  try{
+    const r=await fetch('/api/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paused:next})});
+    const j=await r.json();
+    pb.dataset.paused=j.paused?'1':'0';
+    pb.textContent=j.paused?'▶ RETOMAR':'⏸ PAUSAR';
+    pb.className='btn'+(j.paused?' paused':'');
+  }catch(e){}
+  pb.disabled=false;
+}
 setInterval(refresh,3000);refresh();
 </script></body></html>"""
 
@@ -1210,6 +1253,7 @@ setInterval(refresh,3000);refresh();
         state = {
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             "local_ts": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            "paused": term.paused,
             "stats": dash.get_total_stats(),
             "traders": [tr.get_stats() for tr in dash.traders.values()],
             "logs": list(dash.log_messages),
@@ -1318,6 +1362,30 @@ class _WebHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if path != "/api/pause":
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            payload = json.loads(self.rfile.read(length).decode() or "{}")
+            paused = bool(payload.get("paused"))
+        except Exception:
+            paused = True
+        self.server.dashboard.terminal.paused = paused
+        body = json.dumps({"ok": True, "paused": paused}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
 
 
 def main():
