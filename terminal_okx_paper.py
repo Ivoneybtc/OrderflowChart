@@ -1018,6 +1018,23 @@ class OKXPaperTerminal:
         for sym in list(self.lot_sizes.keys()):
             if self.posicoes.get(sym):
                 continue
+            # Guarda anti-duplicacao: se a conta JA tem o ativo sem posicao
+            # registrada (orfa que a adocao de boot nao pegou), adota em vez de
+            # abrir nova entrada - evita dobrar exposicao a cada restart.
+            try:
+                bb = await self.okx_trader._request(
+                    "GET", f"/api/v5/account/balance?ccy={sym.split('-')[0]}")
+                bd = ((bb.get("data") or [{}])[0].get("details") or [{}])[0]
+                if float(bd.get("availBal") or 0) > 1e-8:
+                    await self._adotar_orfas()
+                    if self.posicoes.get(sym):
+                        nome_skip = self.sym_trader.get(sym, sym)
+                        self.dashboard.log(
+                            f"Diario {nome_skip}: orfa adotada - entrada cancelada "
+                            f"(evita duplicar exposicao)")
+                        continue
+            except Exception:
+                pass
             try:
                 r = await self.okx_trader._request(
                     "GET", f"/api/v5/market/candles?instId={sym}&bar=1D&limit=40")
@@ -1262,6 +1279,19 @@ class OKXPaperTerminal:
                     continue
                 px = self._preco_atual(sym)
                 if not px:
+                    # No boot o feed de precos pode ainda nao ter o sym (engine WS
+                    # frio) - busca o ticker direto em vez de pular em silencio.
+                    try:
+                        tk = await self.okx_trader._request(
+                            "GET", f"/api/v5/market/ticker?instId={sym}")
+                        t0 = (tk.get("data") or [{}])[0]
+                        px = float(t0.get("last") or 0)
+                    except Exception:
+                        px = 0.0
+                if px <= 0:
+                    self.dashboard.log(
+                        f"Orfa {sym}: sem preco p/ adotar (avail {have:.6f}) - "
+                        f"nova tentativa no proximo ciclo")
                     continue
                 r = await self.okx_trader._request(
                     "GET", f"/api/v5/market/candles?instId={sym}&bar=1D&limit=20")
@@ -1287,6 +1317,15 @@ class OKXPaperTerminal:
                     f"(entry {px:.2f}, stop {pos['stop_px']:.2f}) - sem duplicar entrada")
             except Exception as e:
                 self.dashboard.log(f"Erro ao adotar orfa {sym}: {str(e)[:60]}")
+
+    async def _adocao_tardia(self):
+        """2a passada de adocao de orfas, ~15s apos o boot (corrida de preco)."""
+        try:
+            await asyncio.sleep(15)
+            await self._adotar_orfas()
+        except Exception as e:
+            self.dashboard.log(f"Adocao tardia falhou: {str(e)[:60]}")
+
     def run(self):
         """Synchronous entry point - creates and runs event loop"""
         # Create and run event loop
@@ -1335,6 +1374,9 @@ class OKXPaperTerminal:
             self.dashboard.log("Engine V4 (momentum diario) iniciado - feed visual ativo")
             self._carregar_posicoes()
             await self._adotar_orfas()
+            # 2a passada ~15s depois do boot: cobre orfas que a 1a tentativa nao
+            # pegou por corrida (preco do feed ainda indisponivel naquele instante)
+            asyncio.create_task(self._adocao_tardia())
         except Exception as e:
             self.dashboard.log(f"Engine visual falhou: {e}")
             self.posicoes = {t.okx_symbol: None for t in self.dashboard.traders.values()}
