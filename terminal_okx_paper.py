@@ -1022,8 +1022,10 @@ class OKXPaperTerminal:
         except Exception as e:
             self.dashboard.log(f"Nao restaurou posicoes: {e}")
 
-    async def _alertar_orfas(self):
-        """Se a conta tem ativo base sem estado no bot (restart sem arquivo), alerta."""
+    async def _adotar_orfas(self):
+        """Se a conta tem ativo base sem posicao registrada (restart/redeploy perdeu o
+        JSON), ADOTA: registra com entry=preco atual e stop/alvo calculados com ATR.
+        Evita reabrir (duplicar exposicao) e devolve a gestao de risco ao ativo."""
         for sym in list(self.lot_sizes.keys()):
             if self.posicoes.get(sym):
                 continue
@@ -1032,12 +1034,35 @@ class OKXPaperTerminal:
                 b = await self.okx_trader._request("GET", f"/api/v5/account/balance?ccy={base}")
                 det = ((b.get("data") or [{}])[0].get("details") or [{}])[0]
                 have = float(det.get("availBal") or 0)
-                if have > 0:
-                    self.dashboard.log(
-                        f"ALERTA: {have:.6f} {base} na conta sem posicao registrada - "
-                        f"pode ser posicao orfa de restart (gere manualmente)")
-            except Exception:
-                pass
+                if have <= 1e-8:
+                    continue
+                px = self._preco_atual(sym)
+                if not px:
+                    continue
+                r = await self.okx_trader._request(
+                    "GET", f"/api/v5/market/candles?instId={sym}&bar=1D&limit=20")
+                data = r.get("data") or []
+                atr = 0.0
+                if len(data) >= 16:
+                    fechados = list(reversed(data[1:]))
+                    candles = [{"h": float(c[2]), "l": float(c[3]), "c": float(c[4])}
+                               for c in fechados]
+                    atrs = self._atr14(candles)
+                    atr = atrs[-1] if atrs else 0.0
+                if atr <= 0:
+                    atr = px * 0.03  # fallback: 3%
+                cfg = self.v4_config
+                pos = {"sym": sym, "qty": have, "entry_px": px,
+                       "stop_px": round(px - cfg["k_atr"] * atr, 8),
+                       "target_px": round(px + cfg["k_atr"] * atr * cfg["rr"], 8),
+                       "aberta_ts": time.time(), "fee_open": 0.0,
+                       "trade_id": None, "adotada": True}
+                self.posicoes[sym] = pos
+                self.dashboard.log(
+                    f"ORFA ADOTADA: {self.sym_trader.get(sym, sym)} {have:.6f} {base} "
+                    f"(entry {px:.2f}, stop {pos['stop_px']:.2f}) - sem duplicar entrada")
+            except Exception as e:
+                self.dashboard.log(f"Erro ao adotar orfa {sym}: {str(e)[:60]}")
     def run(self):
         """Synchronous entry point - creates and runs event loop"""
         # Create and run event loop
@@ -1083,7 +1108,7 @@ class OKXPaperTerminal:
             self.engine_task = asyncio.create_task(self.engine.run())
             self.dashboard.log("Engine V4 (momentum diario) iniciado - feed visual ativo")
             self._carregar_posicoes()
-            await self._alertar_orfas()
+            await self._adotar_orfas()
         except Exception as e:
             self.dashboard.log(f"Engine visual falhou: {e}")
             self.posicoes = {t.okx_symbol: None for t in self.dashboard.traders.values()}
