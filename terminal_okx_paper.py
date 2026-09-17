@@ -21,6 +21,7 @@ import sqlite3
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pandas as pd
+from decimal import Decimal, ROUND_DOWN
 
 
 # ===== OKX Paper Trading Classes =====
@@ -201,6 +202,14 @@ class OKXPaperTrader:
         """Ordem REAL de mercado na OKX demo (spot, tdMode=cash).
         - size_is_quote=True (market buy): sz em USDT (moeda de cotacao) = valor em $.
         - senao: sz em quantidade do ativo base (ex.: BTC)."""
+        if side == "sell" and not size_is_quote:
+            # sz de venda e em ativo base: alinha ao lotSz (vender "quebrado" acima
+            # do saldo real e a receita para erro/rejeicao no fechamento)
+            f = await self._filtros(symbol)
+            if f["lot"] > 0:
+                size = self._floor_step(size, f["lot"])
+                if size <= 0:
+                    return {"ok": False, "error": f"qty {size} abaixo do lotSz {f['lot']}"}
         body = {
             "instId": symbol,
             "tdMode": "cash",
@@ -286,6 +295,10 @@ class OKXPaperTrader:
     async def paper_place_limit(self, symbol: str, side: str, size: float,
                                 limit_px: float, signal_info: str = "") -> Dict:
         """Ordem LIMIT real na OKX demo (spot, cash). size em ativo base."""
+        if side == "sell":
+            f = await self._filtros(symbol)
+            if f["lot"] > 0:
+                size = self._floor_step(size, f["lot"])
         body = {
             "instId": symbol, "tdMode": "cash", "side": side,
             "ordType": "limit", "sz": str(size), "px": str(limit_px),
@@ -331,6 +344,36 @@ class OKXPaperTrader:
             ts = 0.01
         self._tick_cache[symbol] = ts
         return ts
+
+    async def _filtros(self, symbol: str) -> Dict[str, float]:
+        """lotSz/minSz/tickSz do instrumento (cache) - base p/ alinhar sz de venda."""
+        if not hasattr(self, "_filtros_cache"):
+            self._filtros_cache: Dict[str, Dict[str, float]] = {}
+        if symbol in self._filtros_cache:
+            return self._filtros_cache[symbol]
+        try:
+            r = await self._request(
+                "GET", f"/api/v5/public/instruments?instType=SPOT&instId={symbol}")
+            spec = (r.get("data") or [{}])[0]
+            out = {"lot": float(spec.get("lotSz") or 0),
+                   "min": float(spec.get("minSz") or 0),
+                   "tick": float(spec.get("tickSz") or 0.01)}
+        except Exception:
+            out = {"lot": 0.0, "min": 0.0, "tick": 0.01}
+        self._filtros_cache[symbol] = out
+        return out
+
+    @staticmethod
+    def _floor_step(value: float, step: float) -> float:
+        """Arredonda value PARA BAIXO na resolucao do step (sz de venda nunca
+        pode passar do saldo real; OKX trunca por conta propria, mas mandar valor
+        acima do saldo e do passo e pedir para ser rejeitado)."""
+        if step <= 0:
+            return value
+        try:
+            return float(Decimal(str(value)).quantize(Decimal(str(step)), rounding=ROUND_DOWN))
+        except Exception:
+            return value
 
     @staticmethod
     def _round_step(value: float, step: float) -> float:
@@ -1216,6 +1259,17 @@ class OKXPaperTerminal:
                 f"- vendendo o total")
             pos["qty"] = real
             self._salvar_posicoes()
+        # Saldo abaixo do minSz nao tem venda possivel (poeira): encerra a posicao
+        # em vez de tentar vender para sempre a cada 60s.
+        _f = await self.okx_trader._filtros(sym)
+        _vendavel = self.okx_trader._floor_step(pos["qty"], _f["lot"]) if _f["lot"] > 0 else pos["qty"]
+        if _f["min"] > 0 and _vendavel < _f["min"]:
+            self.dashboard.log(
+                f"{nome_t}: saldo {_vendavel:.10f} abaixo do minSz {_f['min']} (poeira) - "
+                f"posicao encerrada sem venda")
+            self.posicoes[sym] = None
+            self._salvar_posicoes()
+            return
         resp = await self.okx_trader.close_position_robust(sym, pos["qty"])
         if not resp.get("ok"):
             pos["ultima_tentativa"] = time.time()
