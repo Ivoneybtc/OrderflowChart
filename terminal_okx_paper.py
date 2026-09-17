@@ -86,6 +86,7 @@ class PaperAccount:
     available: float = 10000.0
     frozen: float = 0.0
     total_fees: float = 0.0
+    total_eq: float = 0.0        # equity real da conta na OKX (todos os ativos)
 
 
 class OKXPaperTrader:
@@ -422,7 +423,8 @@ class OKXPaperTrader:
             "realized_pnl": total_realized,
             "unrealized_pnl": total_unrealized,
             "positions": len(self.positions),
-            "open_orders": len([o for o in self.orders.values() if o.get("status") == "LIVE"])
+            "open_orders": len([o for o in self.orders.values() if o.get("status") == "LIVE"]),
+            "total_eq": round(self.account.total_eq or 0, 2),
         }
     
     async def close(self):
@@ -890,7 +892,14 @@ class OKXPaperTerminal:
             "rr": float(os.environ.get("V4_RR", "2.0")),
             "timeout_dias": int(os.environ.get("V4_TIMEOUT_DIAS", "20")),
             "fracao": float(os.environ.get("V4_FRACAO", "0.25")),
+            # Banca de REFERENCIA da demo: a conta carrega patrimonio antigo (BRL,
+            # OKB e sobras de ciclos antigos) que nao pode dimensionar entrada.
+            # V4_BANCA=0 volta a usar o USDT disponivel da conta.
+            "banca": float(os.environ.get("V4_BANCA", "1000")),
+            "min_entrada": float(os.environ.get("V4_MIN_ENTRADA", "12")),
         }
+        self._market_refresh_s: float = float(os.environ.get("V4_MARKET_REFRESH", "10"))
+        self._ultimo_market_refresh: float = 0.0
         self.posicoes: Dict[str, Optional[Dict]] = {}   # symbol -> posicao ativa (ou None)
         self.ultimo_dia_checado: Optional[int] = None   # dia UTC ja processado
         self._ultima_tentativa_diaria: float = 0.0
@@ -948,6 +957,27 @@ class OKXPaperTerminal:
             ticker = await self.okx_trader._request("GET", f"/api/v5/market/ticker?instId={symbol}")
             if "data" in ticker and ticker["data"]:
                 self.okx_trader.market_data[symbol] = ticker["data"][0]
+
+    async def _refresh_mercado(self):
+        """Tickers ao vivo (dashboard + fallback de preco) e equity real da conta.
+
+        Antes o market_data era uma foto unica tirada no boot: painel congelado e,
+        pior, stop/alvo avaliados contra preco velho quando o feed WS caia."""
+        syms = list(self.lot_sizes.keys()) or [t.okx_symbol for t in self.dashboard.traders.values()]
+        for symbol in syms:
+            try:
+                ticker = await self.okx_trader._request(
+                    "GET", f"/api/v5/market/ticker?instId={symbol}")
+                if ticker.get("data"):
+                    self.okx_trader.market_data[symbol] = ticker["data"][0]
+            except Exception:
+                pass
+        try:
+            b = await self.okx_trader._request("GET", "/api/v5/account/balance")
+            self.okx_trader.account.total_eq = float(
+                ((b.get("data") or [{}])[0]).get("totalEq") or 0)
+        except Exception:
+            pass
     
     # ================= V4: MOMENTUM MULTI-DIARIO =================
     # Validado em backtest (33 meses, 4 ativos, ~1.000 candles diarios):
@@ -976,6 +1006,13 @@ class OKXPaperTerminal:
 
     async def check_signals(self):
         """V4: monitora posicoes (stop/alvo/timeout) + checagem diaria de entradas."""
+        agora = time.time()
+        if agora - self._ultimo_market_refresh >= self._market_refresh_s:
+            self._ultimo_market_refresh = agora
+            try:
+                await self._refresh_mercado()
+            except Exception as e:
+                self.dashboard.log(f"Refresh de mercado falhou: {str(e)[:60]}")
         if self.paused:
             if not self._pause_announced:
                 self._pause_announced = True
@@ -1017,6 +1054,11 @@ class OKXPaperTerminal:
         cfg = self.v4_config
         for sym in list(self.lot_sizes.keys()):
             if self.posicoes.get(sym):
+                # Vaga ocupada: loga TODOS os dias para o operador ver que o robo
+                # esta avaliando (antes ficava silencioso e o dashboard parecia morto)
+                self.dashboard.log(
+                    f"Diario {self.sym_trader.get(sym, sym)}: vaga ocupada "
+                    f"(posicao aberta) - sem entrada")
                 continue
             # Guarda anti-duplicacao: se a conta JA tem o ativo sem posicao
             # registrada (orfa que a adocao de boot nao pegou), adota em vez de
@@ -1025,7 +1067,7 @@ class OKXPaperTerminal:
                 bb = await self.okx_trader._request(
                     "GET", f"/api/v5/account/balance?ccy={sym.split('-')[0]}")
                 bd = ((bb.get("data") or [{}])[0].get("details") or [{}])[0]
-                if float(bd.get("availBal") or 0) > 1e-8:
+                if self._saldo_relevante(sym, float(bd.get("availBal") or 0)):
                     await self._adotar_orfas()
                     if self.posicoes.get(sym):
                         nome_skip = self.sym_trader.get(sym, sym)
@@ -1067,8 +1109,11 @@ class OKXPaperTerminal:
             usdt = float(det.get("availBal") or 0)
         except Exception:
             usdt = 0.0
-        montante = usdt * cfg["fracao"]
-        if montante < 12:
+        # A demo carrega patrimonio antigo (BRL/OKB/sobras) que nao e caixa da
+        # estrategia: dimensiona pela BANCA DE REFERENCIA, nunca acima do disponivel
+        base = min(usdt, cfg["banca"]) if cfg["banca"] > 0 else usdt
+        montante = base * cfg["fracao"]
+        if montante < cfg["min_entrada"]:
             self.dashboard.log(f"{nome}: saldo insuficiente p/ entrada (USDT {usdt:.2f})")
             return
         resp = await self.okx_trader.paper_place_order(sym, "buy", montante)
@@ -1090,21 +1135,29 @@ class OKXPaperTerminal:
         self.posicoes[sym] = pos
         self._salvar_posicoes()
         self.dashboard.log(
-            f"ENTRADA {nome} LONG {qty} @ {entry_px:.2f} | stop {stop_px:.2f} "
-            f"| alvo {target_px:.2f} | risco ~{cfg['k_atr']*atr/entry_px*100:.2f}%")
+            f"ENTRADA {nome} LONG {qty} @ {entry_px:.2f} | US$ {montante:.2f} "
+            f"(banca ref. US$ {base:.2f}) | stop {stop_px:.2f} | alvo {target_px:.2f} "
+            f"| risco ~{cfg['k_atr']*atr/entry_px*100:.2f}%")
 
     async def _monitor_posicao(self, sym: str, pos: dict):
         px = self._preco_atual(sym)
-        if not px:
-            return
         cfg = self.v4_config
         dias = (time.time() - pos["aberta_ts"]) / 86400.0
         motivo = None
-        if px <= pos["stop_px"]:
-            motivo = "stop"
-        elif px >= pos["target_px"]:
-            motivo = "alvo"
-        elif dias >= cfg["timeout_dias"]:
+        if px:
+            pos["_sem_preco"] = False
+            if px <= pos["stop_px"]:
+                motivo = "stop"
+            elif px >= pos["target_px"]:
+                motivo = "alvo"
+        elif not pos.get("_sem_preco"):
+            # Sem preco (feed frio e ticker fora): NUNCA sair em silencio. Loga 1x e
+            # segue avaliando o timeout, que nao depende de preco.
+            pos["_sem_preco"] = True
+            self.dashboard.log(
+                f"{self.sym_trader.get(sym, sym)}: SEM PRECO no feed/ticker - stop e "
+                f"alvo nao avaliados (timeout de {cfg['timeout_dias']}d segue valendo)")
+        if motivo is None and dias >= cfg["timeout_dias"]:
             motivo = "timeout"
         if motivo:
             # backoff de 60s entre tentativas de fechamento que falharam
@@ -1263,6 +1316,17 @@ class OKXPaperTerminal:
         except Exception as e:
             self.dashboard.log(f"Nao restaurou posicoes: {e}")
 
+    def _saldo_relevante(self, sym: str, qty: float) -> bool:
+        """Poeira nao conta como posicao: so adota/gerencia se o notional justificar
+        (mesmo piso da entrada minima). Sem isso, 1e-07 de ETH/DOGE herdado virava
+        "posicao" e travava a vaga daquele ativo (stop/alvo/timeout sem sentido)."""
+        if qty <= 1e-8:
+            return False
+        px = self._preco_atual(sym) or 0.0
+        if px <= 0:
+            return qty >= 1e-4      # sem preco: exige quantidade minima absoluta
+        return qty * px >= self.v4_config["min_entrada"]
+
     async def _adotar_orfas(self):
         """Se a conta tem ativo base sem posicao registrada (restart/redeploy perdeu o
         JSON), ADOTA: registra com entry=preco atual e stop/alvo calculados com ATR.
@@ -1275,7 +1339,10 @@ class OKXPaperTerminal:
                 b = await self.okx_trader._request("GET", f"/api/v5/account/balance?ccy={base}")
                 det = ((b.get("data") or [{}])[0].get("details") or [{}])[0]
                 have = float(det.get("availBal") or 0)
-                if have <= 1e-8:
+                if not self._saldo_relevante(sym, have):
+                    if have > 0:
+                        self.dashboard.log(
+                            f"Orfa {sym}: poeira ({have:.10f}) ignorada - nao bloqueia a vaga")
                     continue
                 px = self._preco_atual(sym)
                 if not px:
@@ -1314,7 +1381,8 @@ class OKXPaperTerminal:
                 self.posicoes[sym] = pos
                 self.dashboard.log(
                     f"ORFA ADOTADA: {self.sym_trader.get(sym, sym)} {have:.6f} {base} "
-                    f"(entry {px:.2f}, stop {pos['stop_px']:.2f}) - sem duplicar entrada")
+                    f"(entry {px:.2f}, ~US$ {have * px:,.0f}, stop {pos['stop_px']:.2f}) "
+                    f"- sem duplicar entrada")
             except Exception as e:
                 self.dashboard.log(f"Erro ao adotar orfa {sym}: {str(e)[:60]}")
 
@@ -1341,6 +1409,19 @@ class OKXPaperTerminal:
             clear_screen()
             print("\nOKX Paper Trading finalizado.")
     
+    def _engine_task_terminou(self, task):
+        """Loga SEMPRE o fim do feed de precos (antes morria em silencio e as
+        posicoes ficavam sem stop/alvo por dias sem ninguem saber)."""
+        if task.cancelled():
+            return
+        exc = task.exception() if not task.cancelled() else None
+        if exc is None:
+            self.dashboard.log("Feed de precos encerrou sem erro")
+            return
+        self.dashboard.log(
+            f"FEED DE PRECOS PAROU: {type(exc).__name__}: {str(exc)[:90]} "
+            f"- stop/alvo passam a usar o ticker (refresh de {self._market_refresh_s:.0f}s)")
+
     async def _run_loop(self):
         print("Iniciando OKX Paper Trading Terminal...")
         
@@ -1351,6 +1432,11 @@ class OKXPaperTerminal:
         self.add_trader("Delta", "SOLUSDT", 12.00, 60)
         # Restaura o historico de operacoes resolvidas (P&L sobrevive a restart)
         self._restaurar_historico()
+        _c = self.v4_config
+        self.dashboard.log(
+            f"Banca de referencia: US$ {_c['banca']:.2f} | {_c['fracao']*100:.0f}% por ativo "
+            f"(US$ {_c['banca'] * _c['fracao']:.2f}/entrada) | "
+            f"stop {_c['k_atr']}xATR14 | alvo 1:{_c['rr']:.0f} | timeout {_c['timeout_dias']}d")
         
         print(f"Conectando OKX API (Demo)...")
         
@@ -1371,6 +1457,8 @@ class OKXPaperTerminal:
             # a execucao V4 e diaria (momentum multi-diario), nao usa footprint
             self.engine = FootprintFeed(symbols, candle_seconds=300, on_candle_close=None)
             self.engine_task = asyncio.create_task(self.engine.run())
+            # Feed morrendo calado foi bug real: agora a excecao sempre aparece no log
+            self.engine_task.add_done_callback(self._engine_task_terminou)
             self.dashboard.log("Engine V4 (momentum diario) iniciado - feed visual ativo")
             self._carregar_posicoes()
             await self._adotar_orfas()
@@ -1469,16 +1557,20 @@ async function refresh(){
     const pb=document.getElementById('pauseBtn');
     if(pb){pb.dataset.paused=s.paused?'1':'0';pb.textContent=s.paused?'▶ RETOMAR':'⏸ PAUSAR';pb.className='btn'+(s.paused?' paused':'');}
     document.getElementById('clock').textContent='Atualizado: '+s.local_ts+'  |  '+s.ts;
-    const st=s.stats,ac=s.account||{};
+    const st=s.stats,ac=s.account||{},bc=s.banca||{};
+    const posList=(s.positions||[]);
+    const upl=posList.reduce((a,p)=>a+(p.unrealized_pnl||0),0);
     const cards=[
       ['P&L TOTAL',pnl(st.total_pnl),st.total_pnl],
       ['WIN RATE',`<span class="${st.win_rate>=60?'pos':(st.win_rate>=50?'neu':'neg')}">${st.win_rate}%</span>`,0],
       ['OPS',st.operations,0],['WINS',`<span class="pos">${st.wins}</span>`,0],
       ['LOSSES',`<span class="neg">${st.losses}</span>`,0],
-      ['SALDO OKX','$'+fmt(ac.balance),0],
-      ['DISPONIVEL','$'+fmt(ac.available),0],
-      ['P&L OKX',pnl(ac.total_pnl),ac.total_pnl||0],
-      ['POSICOES',ac.positions??'--',0]
+      ['USDT OKX','$'+fmt(ac.available),0],
+      ['EQUITY TOTAL','$'+fmt(ac.total_eq),0],
+      ['BANCA PADRAO','$'+fmt(bc.referencia),0],
+      ['ENTRADA ALVO','$'+fmt(bc.entrada),0],
+      ['P&L ABERTO',pnl(upl),upl],
+      ['POSICOES ABERTAS',posList.length,0]
     ];
     document.getElementById('cards').innerHTML=cards.map(c=>`<div class="card"><div class="k">${c[0]}</div><div class="v">${c[1]}</div></div>`).join('');
     const mk=symbol=>(s.market||{})[symbol]||{};
@@ -1490,8 +1582,8 @@ async function refresh(){
     }).join('');
     document.getElementById('traders').innerHTML=`<thead><tr><th>#</th><th>TRADER</th><th>PAR</th><th>BET</th><th>EXP</th><th>ST</th><th>WINS</th><th>LOSSES</th><th>WR%</th><th>P&L</th><th>STREAK</th></tr></thead><tbody>`+s.traders.map((t,i)=>`<tr><td>${i+1}</td><td>${t.name}</td><td>${t.pair}</td><td>$${fmt(t.bet_size)}</td><td>${t.expiration}s</td><td><span class="pill ${t.enabled?'on':'off'}">${t.enabled?'ON':'OFF'}</span></td><td class="pos">${t.wins}</td><td class="neg">${t.losses}</td><td class="${t.win_rate>=60?'pos':(t.win_rate>=50?'neu':'neg')}">${t.win_rate}%</td><td>${pnl(t.total_pnl)}</td><td class="${cls(t.current_streak)}">${t.current_streak?((t.current_streak>0?'+':'')+t.current_streak+' '+t.streak_type):'--'}</td></tr>`).join('')+`</tbody>`;
     document.getElementById('ops').innerHTML=`<thead><tr><th>HORA</th><th>TRADER</th><th>PAR</th><th>DIR</th><th>BET</th><th>PROB</th><th>RESULTADO</th><th>ST</th><th>P&L ACC</th></tr></thead><tbody>`+(s.operations.length?s.operations.slice().reverse().map(o=>`<tr><td>${o.timestamp}</td><td>${o.trader}</td><td>${o.pair}</td><td class="${o.direction==='CALL'?'pos':'neg'}">${o.direction==='CALL'?'▲ CALL':'▼ PUT'}</td><td>$${fmt(o.bet)}</td><td>${fmt(o.probability)}</td><td>${o.result==null?'--':pnl(o.result)}</td><td><span class="pill ${o.status==='WIN'?'win':(o.status==='LOSS'?'loss':'w8')}">${o.status==='Aguardando'?'AGUARDANDO':o.status}</span></td><td>${pnl(o.cumulative_pnl)}</td></tr>`).join(''):`<tr><td colspan="9" style="color:#64748b">Aguardando operacoes...</td></tr>`)+`</tbody>`;
-    const pos=(s.positions||[]);
-    document.getElementById('pos').innerHTML=`<thead><tr><th>TRADER</th><th>SIMBOLO</th><th>LADO</th><th>TAMANHO</th><th>ENTRADA</th><th>STOP</th><th>ALVO</th><th>STATUS</th></tr></thead><tbody>`+(pos.length?pos.map(p=>`<tr><td>${p.trader}</td><td>${p.symbol}</td><td class="${p.side==='buy'?'pos':'neg'}">${p.side==='buy'?'▲ COMPRA':'▼ VENDA'}</td><td>${p.size}</td><td>${p.entry_price==null?'--':'$'+fmt(p.entry_price)}</td><td>${p.stop_px==null?'--':'$'+fmt(p.stop_px)}</td><td>${p.target_px==null?'--':'$'+fmt(p.target_px)}</td><td><span class="pill ${p.status&&p.status.startsWith('ABERTA')?'win':'w8'}">${p.status}</span></td></tr>`).join(''):`<tr><td colspan="8" style="color:#64748b">Nenhuma posicao (momentum diario - checagem 1x/dia apos close UTC)</td></tr>`)+`</tbody>`;
+    const pos=posList;
+    document.getElementById('pos').innerHTML=`<thead><tr><th>TRADER</th><th>SIMBOLO</th><th>LADO</th><th>TAMANHO</th><th>ENTRADA</th><th>ATUAL</th><th>STOP</th><th>ALVO</th><th>P&L ABERTO</th><th>STATUS</th></tr></thead><tbody>`+(pos.length?pos.map(p=>`<tr><td>${p.trader}</td><td>${p.symbol}</td><td class="${p.side==='buy'?'pos':'neg'}">${p.side==='buy'?'▲ COMPRA':'▼ VENDA'}</td><td>${p.size}</td><td>${p.entry_price==null?'--':'$'+fmt(p.entry_price)}</td><td>${p.mark_price==null?'--':'$'+fmt(p.mark_price)}</td><td>${p.stop_px==null?'--':'$'+fmt(p.stop_px)}</td><td>${p.target_px==null?'--':'$'+fmt(p.target_px)}</td><td>${p.unrealized_pnl==null?'--':pnl(p.unrealized_pnl)+(p.unrealized_pct==null?'':` <span class="${cls(p.unrealized_pct)}">(${p.unrealized_pct>0?'+':''}${fmt(p.unrealized_pct)}%)</span>`)}</td><td><span class="pill ${p.status&&p.status.startsWith('ABERTA')?'win':'w8'}">${p.status}</span></td></tr>`).join(''):`<tr><td colspan="10" style="color:#64748b">Nenhuma posicao (momentum diario - checagem 1x/dia apos close UTC)</td></tr>`)+`</tbody>`;
     document.getElementById('logs').innerHTML=(s.logs||[]).map(l=>`<div>${l.replace(/Analisando|SINAL|RESOLVIDO|Erro/g,'<b>$&</b>')}</div>`).join('')||'<div>sem logs</div>';
   }catch(e){
     document.getElementById('live').className='off';
@@ -1557,16 +1649,26 @@ setInterval(refresh,3000);refresh();
                         state["market"][sym]["delta"] = round(d * last, 2) if last else None
             except Exception:
                 pass
-        # Posicoes V4 (momentum multi-diario)
+        # Banca de referencia da estrategia (dimensionamento)
+        _c = term.v4_config
+        state["banca"] = {"referencia": _c["banca"], "fracao": _c["fracao"],
+                          "entrada": round(_c["banca"] * _c["fracao"], 2),
+                          "timeout_dias": _c["timeout_dias"]}
+        # Posicoes V4 (momentum multi-diario) + mark-to-market
         state["positions"] = []
         for sym, p in (term.posicoes or {}).items():
             if p:
                 trader_nm = term.sym_trader.get(sym, sym)
                 dias = max(0, int((time.time() - p["aberta_ts"]) / 86400.0))
+                px = term._preco_atual(sym)
+                upl = round((px - p["entry_px"]) * p["qty"], 2) if px else None
+                upl_pct = round((px / p["entry_px"] - 1) * 100, 2) if px and p.get("entry_px") else None
                 state["positions"].append({
                     "trader": trader_nm, "symbol": sym,
                     "side": "buy", "size": p.get("qty"),
                     "entry_price": p.get("entry_px"),
+                    "mark_price": round(px, 8) if px else None,
+                    "unrealized_pnl": upl, "unrealized_pct": upl_pct,
                     "opened_at": f"{dias}d",
                     "stop_px": p.get("stop_px"), "target_px": p.get("target_px"),
                     "status": f"ABERTA {dias}d",

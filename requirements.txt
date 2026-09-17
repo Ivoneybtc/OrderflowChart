@@ -2,3 +2,4 @@ numpy>=1.26
 pandas>=2.2
 plotly>=5.18
 httpx>=0.27
+websockets>=12

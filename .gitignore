@@ -13,6 +13,7 @@ debug_output.txt
 # Dados gerados localmente
 data/*.csv
 data/*.json
+data/*.db
 
 # OS
 Thumbs.db
