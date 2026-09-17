@@ -900,6 +900,7 @@ class OKXPaperTerminal:
         }
         self._market_refresh_s: float = float(os.environ.get("V4_MARKET_REFRESH", "10"))
         self._ultimo_market_refresh: float = 0.0
+        self._entrando: set = set()      # guarda de reentrada por simbolo (evita duplicar entrada)
         self.posicoes: Dict[str, Optional[Dict]] = {}   # symbol -> posicao ativa (ou None)
         self.ultimo_dia_checado: Optional[int] = None   # dia UTC ja processado
         self._ultima_tentativa_diaria: float = 0.0
@@ -974,8 +975,14 @@ class OKXPaperTerminal:
                 pass
         try:
             b = await self.okx_trader._request("GET", "/api/v5/account/balance")
-            self.okx_trader.account.total_eq = float(
-                ((b.get("data") or [{}])[0]).get("totalEq") or 0)
+            d0 = (b.get("data") or [{}])[0]
+            self.okx_trader.account.total_eq = float(d0.get("totalEq") or 0)
+            # saldo USDT tambem ao vivo (antes so era lido no boot: o card ficava
+            # defasado depois de cada entrada/fechamento)
+            for det in (d0.get("details") or []):
+                if det.get("ccy") == "USDT":
+                    self.okx_trader.account.balance = float(det.get("cashBal") or 0)
+                    self.okx_trader.account.available = float(det.get("availBal") or 0)
         except Exception:
             pass
     
@@ -1116,12 +1123,38 @@ class OKXPaperTerminal:
         if montante < cfg["min_entrada"]:
             self.dashboard.log(f"{nome}: saldo insuficiente p/ entrada (USDT {usdt:.2f})")
             return
-        resp = await self.okx_trader.paper_place_order(sym, "buy", montante)
-        if not resp.get("ok"):
+        if sym in self._entrando:
+            self.dashboard.log(f"{nome}: entrada ja em andamento - ignorando duplicata")
+            return
+        self._entrando.add(sym)
+        try:
+            resp = await self.okx_trader.paper_place_order(sym, "buy", montante)
+        finally:
+            self._entrando.discard(sym)
+        # "falhou" NAO significa "nao comprou": a OKX pode preencher e o wrapper nao
+        # confirmar em ~7s. Se algo preencheu, registra o que existe (nunca deixar
+        # exposicao real sem registro).
+        fill_sz = float(resp.get("fill_sz") or 0)
+        if not resp.get("ok") and fill_sz <= 0:
             self.dashboard.log(f"{nome}: entrada FALHOU: {resp.get('error')}")
             return
-        entry_px = resp["avg_px"]
-        qty = float(resp.get("fill_sz") or 0) or (montante / entry_px if entry_px else 0.0)
+        entry_px = float(resp.get("avg_px") or 0) or (self._preco_atual(sym) or 0.0)
+        if entry_px <= 0:
+            # Sem preco nao ha stop/alvo possivel: nao registra posicao quebrada
+            # (a guarda anti-duplicacao adota o ativo no proximo ciclo diario).
+            self.dashboard.log(
+                f"{nome}: sem preco de entrada (avgPx e feed vazios) - posicao NAO "
+                f"registrada; o ativo sera adotado no proximo ciclo")
+            return
+        # qty REAL (availBal): o buy de spot cobra a fee no ativo, entao o fill bruto
+        # e maior que o saldo e quebrava o fechamento (venda maior que o existente)
+        qty = await self._saldo_ativo(sym)
+        if qty <= 0:
+            qty = fill_sz or (montante / entry_px if entry_px else 0.0)
+        if not resp.get("ok"):
+            self.dashboard.log(
+                f"{nome}: entrada PARCIAL/incerta ({resp.get('error')}) - registrando "
+                f"{qty:.8f} existentes em conta")
         stop_px = round(entry_px - cfg["k_atr"] * atr, 8)
         target_px = round(entry_px + cfg["k_atr"] * atr * cfg["rr"], 8)
         pos = {"sym": sym, "qty": qty, "entry_px": entry_px, "stop_px": stop_px,
@@ -1166,6 +1199,23 @@ class OKXPaperTerminal:
                 await self._fechar_posicao(sym, pos, motivo)
 
     async def _fechar_posicao(self, sym: str, pos: dict, motivo: str):
+        # Nunca vender mais do que existe: qty registrada > saldo real faz o
+        # fechamento falhar para sempre (fee do buy cobrada no ativo, venda parcial,
+        # execucao manual). E sobra nao registrada e vendida junto.
+        real = await self._saldo_ativo(sym)
+        nome_t = self.sym_trader.get(sym, sym)
+        if 1e-8 < real < pos["qty"] * 0.999:
+            self.dashboard.log(
+                f"{nome_t}: qty registrada {pos['qty']:.8f} > saldo real {real:.8f} "
+                f"- vendendo o disponivel")
+            pos["qty"] = real
+            self._salvar_posicoes()
+        elif real > pos["qty"] * 1.001:
+            self.dashboard.log(
+                f"{nome_t}: saldo real {real:.8f} > qty registrada {pos['qty']:.8f} "
+                f"- vendendo o total")
+            pos["qty"] = real
+            self._salvar_posicoes()
         resp = await self.okx_trader.close_position_robust(sym, pos["qty"])
         if not resp.get("ok"):
             pos["ultima_tentativa"] = time.time()
@@ -1316,6 +1366,19 @@ class OKXPaperTerminal:
         except Exception as e:
             self.dashboard.log(f"Nao restaurou posicoes: {e}")
 
+    async def _saldo_ativo(self, sym: str) -> float:
+        """availBal REAL do ativo base (ja net de fee) - fonte da verdade da qty.
+
+        Buy de spot na demo cobra a fee NO ATIVO: registrar o fill bruto faz o
+        fechamento tentar vender mais do que existe e falhar para sempre."""
+        base = sym.split("-")[0]
+        try:
+            b = await self.okx_trader._request("GET", f"/api/v5/account/balance?ccy={base}")
+            det = ((b.get("data") or [{}])[0].get("details") or [{}])[0]
+            return float(det.get("availBal") or 0)
+        except Exception:
+            return 0.0
+
     def _saldo_relevante(self, sym: str, qty: float) -> bool:
         """Poeira nao conta como posicao: so adota/gerencia se o notional justificar
         (mesmo piso da entrada minima). Sem isso, 1e-07 de ETH/DOGE herdado virava
@@ -1326,6 +1389,25 @@ class OKXPaperTerminal:
         if px <= 0:
             return qty >= 1e-4      # sem preco: exige quantidade minima absoluta
         return qty * px >= self.v4_config["min_entrada"]
+
+    async def _reconciliar_posicoes(self):
+        """Alinha a qty registrada com o saldo REAL da conta no boot.
+
+        Divergencias acontecem por fee cobrada no ativo, venda parcial ou execucao
+        manual - e qty registrada > saldo real = fechamento que falha para sempre."""
+        for sym, pos in list((self.posicoes or {}).items()):
+            if not pos:
+                continue
+            real = await self._saldo_ativo(sym)
+            reg = float(pos.get("qty") or 0)
+            if real <= 1e-8 or reg <= 0:
+                continue
+            if abs(real - reg) > max(1e-8, reg * 0.0005):
+                self.dashboard.log(
+                    f"RECONCILIADO {self.sym_trader.get(sym, sym)}: qty {reg:.8f} -> "
+                    f"{real:.8f} (saldo real da conta)")
+                pos["qty"] = real
+        self._salvar_posicoes()
 
     async def _adotar_orfas(self):
         """Se a conta tem ativo base sem posicao registrada (restart/redeploy perdeu o
@@ -1385,6 +1467,9 @@ class OKXPaperTerminal:
                     f"- sem duplicar entrada")
             except Exception as e:
                 self.dashboard.log(f"Erro ao adotar orfa {sym}: {str(e)[:60]}")
+        # Posicao adotada TAMBEM precisa persistir (antes o JSON nao era gravado:
+        # cada deploy re-adotava com entry = preco da hora e distorcia o P&L)
+        self._salvar_posicoes()
 
     async def _adocao_tardia(self):
         """2a passada de adocao de orfas, ~15s apos o boot (corrida de preco)."""
@@ -1461,6 +1546,7 @@ class OKXPaperTerminal:
             self.engine_task.add_done_callback(self._engine_task_terminou)
             self.dashboard.log("Engine V4 (momentum diario) iniciado - feed visual ativo")
             self._carregar_posicoes()
+            await self._reconciliar_posicoes()
             await self._adotar_orfas()
             # 2a passada ~15s depois do boot: cobre orfas que a 1a tentativa nao
             # pegou por corrida (preco do feed ainda indisponivel naquele instante)
